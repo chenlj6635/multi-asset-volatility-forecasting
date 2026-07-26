@@ -1,0 +1,7 @@
+numpy>=1.24
+pandas>=2.0
+pyarrow>=12
+matplotlib>=3.7
+PyYAML>=6.0
+yfinance>=0.2.40
+pytest>=7.4

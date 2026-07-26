@@ -1,0 +1,36 @@
+project:
+  name: multi-asset-volatility-forecasting
+  timezone: exchange-local dates from Yahoo Finance
+
+data:
+  source: Yahoo Finance via yfinance
+  start_date: "2010-01-01"
+  end_date: null
+  raw_dir: data/raw
+  processed_dir: data/processed
+  quality_dir: data/quality
+  auto_adjust: false
+  allow_close_as_adjusted: false
+  target_assets:
+    SPY: SPY.csv
+    QQQ: QQQ.csv
+    IWM: IWM.csv
+    TLT: TLT.csv
+    GLD: GLD.csv
+    USO: USO.csv
+  context_assets:
+    "^VIX": VIX.csv
+
+calculation:
+  annualization_factor: 252
+  label_horizon: 5
+  baseline_window: 21
+  qlike_epsilon: 1.0e-12
+  extreme_return_threshold: 0.20
+  long_gap_days: 7
+
+outputs:
+  predictions: data/processed/baseline_predictions.parquet
+  metrics: outputs/tables/baseline_metrics.csv
+  metadata: outputs/tables/run_metadata.json
+  figure: outputs/figures/spy_baseline_vs_actual.png
