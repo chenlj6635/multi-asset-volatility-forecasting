@@ -6,7 +6,7 @@ A leakage-controlled, offline-reproducible Week 1 research baseline for forecast
 
 Can volatility information available at the close of day `t` improve forecasts of realized volatility over trading days `t+1` through `t+5`, and can later improvements translate into better risk control?
 
-This first milestone implements the historical-volatility baseline only. It covers SPY, QQQ, IWM, TLT, GLD, and USO. `^VIX` is downloaded and quality-checked as a context series but is not included in baseline metrics.
+This first milestone implements the historical-volatility and EWMA baselines. It covers SPY, QQQ, IWM, TLT, GLD, and USO. `^VIX` is downloaded and quality-checked as a context series but is not included in baseline metrics.
 
 ## Definitions
 
@@ -27,6 +27,15 @@ The label at `t` therefore uses exactly `t+1` through `t+5`; it excludes `r_t`. 
 ```text
 HistoricalRV_t = sqrt(252 * mean(r_i^2 over the last 21 valid returns through t))
 ```
+
+The EWMA baseline uses the recursive variance estimate with `lambda = 0.94`, initialized from the first 21 valid squared returns:
+
+```text
+EWMA variance_t = lambda * EWMA variance_{t-1} + (1 - lambda) * r_t^2
+EWMA RV_t = sqrt(252 * EWMA variance_t)
+```
+
+Both baselines use only information available through `t`.
 
 MAE and RMSE are evaluated on volatility. QLIKE is deliberately evaluated on variance:
 

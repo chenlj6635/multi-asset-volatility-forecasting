@@ -88,9 +88,15 @@ def write_results(
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
-def plot_spy_comparison(frame: pd.DataFrame, output_path: str | Path) -> None:
-    """Save a readable single-axis comparison with color and line-style encoding."""
-    spy = frame.loc[frame["asset"] == "SPY", ["date", "future_rv_5d", "historical_rv_21d"]].dropna()
+def plot_spy_comparison(
+    frame: pd.DataFrame,
+    output_path: str | Path,
+    *,
+    forecast_columns: tuple[str, ...] = ("historical_rv_21d", "ewma_rv"),
+) -> None:
+    """Save a readable SPY comparison for actual and forecast volatility."""
+    columns = ["date", "future_rv_5d", *forecast_columns]
+    spy = frame.loc[frame["asset"] == "SPY", columns].dropna()
     if spy.empty:
         raise ValueError("SPY has no valid observations to plot")
     output_path = Path(output_path)
@@ -100,12 +106,18 @@ def plot_spy_comparison(frame: pd.DataFrame, output_path: str | Path) -> None:
     fig.patch.set_facecolor("#FCFCFB")
     ax.set_facecolor("#FCFCFB")
     ax.plot(spy["date"], spy["future_rv_5d"], color="#0072B2", linewidth=1.6, label="Future 5-day realized volatility")
-    ax.plot(spy["date"], spy["historical_rv_21d"], color="#D55E00", linewidth=1.6, linestyle="--", label="Historical 21-day baseline")
-    ax.set_title("SPY volatility: future realized outcome vs historical baseline", loc="left", weight="bold")
+    styles = {
+        "historical_rv_21d": ("#D55E00", "--", "Historical 21-day baseline"),
+        "ewma_rv": ("#009E73", "-.", "EWMA baseline"),
+    }
+    for column in forecast_columns:
+        color, linestyle, label = styles.get(column, ("#CC79A7", ":", column))
+        ax.plot(spy["date"], spy[column], color=color, linewidth=1.6, linestyle=linestyle, label=label)
+    ax.set_title("SPY volatility: future realized outcome vs baselines", loc="left", weight="bold")
     ax.set_xlabel("Date")
     ax.set_ylabel("Annualized volatility")
     ax.grid(axis="y", color="#D9D9D6", linewidth=0.7, alpha=0.7)
     ax.spines[["top", "right"]].set_visible(False)
-    ax.legend(frameon=False, ncols=2, loc="upper center", bbox_to_anchor=(0.5, -0.14))
+    ax.legend(frameon=False, ncols=3, loc="upper center", bbox_to_anchor=(0.5, -0.14))
     fig.savefig(output_path, dpi=160, facecolor=fig.get_facecolor())
     plt.close(fig)

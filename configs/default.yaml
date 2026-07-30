@@ -25,6 +25,8 @@ calculation:
   annualization_factor: 252
   label_horizon: 5
   baseline_window: 21
+  ewma_lambda: 0.94
+  ewma_min_periods: 21
   qlike_epsilon: 1.0e-12
   extreme_return_threshold: 0.20
   long_gap_days: 7

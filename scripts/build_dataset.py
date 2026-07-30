@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data import load_raw_assets
-from src.features import add_historical_volatility_baseline
+from src.features import add_ewma_volatility_baseline, add_historical_volatility_baseline
 from src.labels import add_future_realized_volatility, add_log_returns
 from src.metrics import metrics_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_quality_report, write_results
@@ -82,12 +82,20 @@ def build(config_path: str | Path) -> dict[str, Any]:
         annualization_factor=float(calculation["annualization_factor"]),
         output_column="historical_rv_21d",
     )
+    target_data = add_ewma_volatility_baseline(
+        target_data,
+        decay=float(calculation["ewma_lambda"]),
+        min_periods=int(calculation["ewma_min_periods"]),
+        annualization_factor=float(calculation["annualization_factor"]),
+        output_column="ewma_rv",
+    )
     prediction_columns = [
-        "asset", "date", "adj_close", "log_return", "future_rv_5d", "historical_rv_21d"
+        "asset", "date", "adj_close", "log_return", "future_rv_5d", "historical_rv_21d", "ewma_rv"
     ]
     predictions = target_data[prediction_columns].reset_index(drop=True)
     metrics = metrics_by_asset(
         predictions,
+        forecast_columns=("historical_rv_21d", "ewma_rv"),
         epsilon=float(calculation["qlike_epsilon"]),
     )
 
@@ -109,11 +117,21 @@ def build(config_path: str | Path) -> dict[str, Any]:
         "label_horizon": calculation["label_horizon"],
         "label_returns": "strictly t+1 through t+5",
         "baseline_window": calculation["baseline_window"],
+        "ewma": {
+            "enabled": True,
+            "lambda": calculation["ewma_lambda"],
+            "min_periods": calculation["ewma_min_periods"],
+            "output_column": "ewma_rv",
+        },
+        "forecast_columns": ["historical_rv_21d", "ewma_rv"],
         "qlike_scale": "variance",
         "raw_files": raw_files,
         "quality_status": quality_summary["status"],
         "prediction_rows": int(len(predictions)),
-        "valid_evaluation_rows": int(predictions[["future_rv_5d", "historical_rv_21d"]].notna().all(axis=1).sum()),
+        "valid_evaluation_rows": {
+            column: int(predictions[["future_rv_5d", column]].notna().all(axis=1).sum())
+            for column in ["historical_rv_21d", "ewma_rv"]
+        },
     }
     write_results(
         predictions,

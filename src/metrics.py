@@ -54,15 +54,26 @@ def metrics_by_asset(
     *,
     actual_column: str = "future_rv_5d",
     forecast_column: str = "historical_rv_21d",
+    forecast_columns: tuple[str, ...] | None = None,
     epsilon: float = 1.0e-12,
 ) -> pd.DataFrame:
-    """Evaluate each asset and a direct pooled ALL row."""
+    """Evaluate each forecast by asset and direct pooled ALL row."""
+    columns = forecast_columns or (forecast_column,)
     rows: list[dict[str, float | int | str]] = []
-    for asset, group in frame.groupby("asset", sort=True):
+    for forecast in columns:
+        for asset, group in frame.groupby("asset", sort=True):
+            rows.append(
+                {
+                    "asset": asset,
+                    "forecast": forecast,
+                    **asdict(evaluate_forecast(group[actual_column], group[forecast], epsilon=epsilon)),
+                }
+            )
         rows.append(
-            {"asset": asset, **asdict(evaluate_forecast(group[actual_column], group[forecast_column], epsilon=epsilon))}
+            {
+                "asset": "ALL",
+                "forecast": forecast,
+                **asdict(evaluate_forecast(frame[actual_column], frame[forecast], epsilon=epsilon)),
+            }
         )
-    rows.append(
-        {"asset": "ALL", **asdict(evaluate_forecast(frame[actual_column], frame[forecast_column], epsilon=epsilon))}
-    )
-    return pd.DataFrame(rows)[["asset", "n_obs", "mae", "rmse", "qlike", "variance_floor_count"]]
+    return pd.DataFrame(rows)[["asset", "forecast", "n_obs", "mae", "rmse", "qlike", "variance_floor_count"]]

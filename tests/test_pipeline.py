@@ -49,6 +49,8 @@ def make_config(tmp_path: Path) -> Path:
             "annualization_factor": 252,
             "label_horizon": 5,
             "baseline_window": 21,
+            "ewma_lambda": 0.94,
+            "ewma_min_periods": 21,
             "qlike_epsilon": 1e-12,
             "extreme_return_threshold": 0.20,
             "long_gap_days": 7,
@@ -81,9 +83,11 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
     assert all(path.exists() and path.stat().st_size > 0 for path in expected)
     predictions = pd.read_parquet(expected[2])
     assert set(predictions.asset) == set(ASSETS[:-1])
+    assert {"historical_rv_21d", "ewma_rv"}.issubset(predictions.columns)
     assert predictions.groupby("asset")["future_rv_5d"].tail(5).isna().all()
     metrics = pd.read_csv(expected[3])
-    assert metrics.asset.tolist() == ["GLD", "IWM", "QQQ", "SPY", "TLT", "USO", "ALL"]
+    assert metrics.asset.tolist() == ["GLD", "IWM", "QQQ", "SPY", "TLT", "USO", "ALL"] * 2
+    assert set(metrics.forecast) == {"historical_rv_21d", "ewma_rv"}
     assert np.isfinite(metrics[["mae", "rmse", "qlike"]].to_numpy()).all()
     saved_metadata = json.loads(expected[4].read_text())
     assert saved_metadata["qlike_scale"] == "variance"

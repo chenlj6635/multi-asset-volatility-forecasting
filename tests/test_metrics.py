@@ -6,7 +6,19 @@ import pandas as pd
 from src.metrics import evaluate_forecast, metrics_by_asset
 
 
-def test_metrics_match_manual_values_and_use_variance_qlike() -> None:
+def test_multiple_forecasts_have_separate_rows() -> None:
+    frame = pd.DataFrame({
+        "asset": ["A", "A", "B"],
+        "future_rv_5d": [1.0, 1.0, 10.0],
+        "historical_rv_21d": [2.0, 2.0, 10.0],
+        "ewma_rv": [1.0, 2.0, 8.0],
+    })
+    table = metrics_by_asset(frame, forecast_columns=("historical_rv_21d", "ewma_rv"))
+    assert set(table["forecast"]) == {"historical_rv_21d", "ewma_rv"}
+    assert len(table) == 6
+    assert table.groupby("forecast").size().tolist() == [3, 3]
+
+
     actual = np.array([0.2, 0.4])
     forecast = np.array([0.1, 0.5])
     result = evaluate_forecast(actual, forecast)

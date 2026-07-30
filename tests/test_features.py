@@ -3,11 +3,28 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pandas.testing as pdt
+import pytest
 
-from src.features import add_historical_volatility_baseline
+from src.features import add_ewma_volatility_baseline, add_historical_volatility_baseline
 
 
-def test_window_start_and_formula() -> None:
+def test_ewma_formula_and_start() -> None:
+    returns = np.arange(1, 26, dtype=float) / 1000
+    frame = pd.DataFrame({"asset": "SPY", "date": pd.date_range("2020-01-01", periods=25), "log_return": returns})
+    result = add_ewma_volatility_baseline(frame, decay=0.9, min_periods=3)
+    expected_variance = np.mean(np.square(returns[:3]))
+    expected_variance = 0.9 * expected_variance + 0.1 * returns[3] ** 2
+    assert result["ewma_rv"].iloc[:2].isna().all()
+    assert result["ewma_rv"].iloc[2] == np.sqrt(252 * np.mean(np.square(returns[:3])))
+    assert result["ewma_rv"].iloc[3] == np.sqrt(252 * expected_variance)
+
+
+def test_ewma_rejects_invalid_decay() -> None:
+    frame = pd.DataFrame({"asset": ["SPY"], "date": pd.date_range("2020-01-01", periods=1), "log_return": [0.01]})
+    with pytest.raises(ValueError, match="decay"):
+        add_ewma_volatility_baseline(frame, decay=1.0)
+
+
     returns = np.arange(1, 26, dtype=float) / 1000
     frame = pd.DataFrame({"asset": "SPY", "date": pd.date_range("2020-01-01", periods=25), "log_return": returns})
     result = add_historical_volatility_baseline(frame, window=21)
