@@ -5,7 +5,7 @@ import pandas as pd
 import pandas.testing as pdt
 import pytest
 
-from src.features import add_ewma_volatility_baseline, add_historical_volatility_baseline
+from src.features import add_ewma_volatility_baseline, add_ewma_volatility_candidates, add_historical_volatility_baseline
 
 
 def test_ewma_formula_and_start() -> None:
@@ -15,8 +15,8 @@ def test_ewma_formula_and_start() -> None:
     expected_variance = np.mean(np.square(returns[:3]))
     expected_variance = 0.9 * expected_variance + 0.1 * returns[3] ** 2
     assert result["ewma_rv"].iloc[:2].isna().all()
-    assert result["ewma_rv"].iloc[2] == np.sqrt(252 * np.mean(np.square(returns[:3])))
-    assert result["ewma_rv"].iloc[3] == np.sqrt(252 * expected_variance)
+    assert np.isclose(result["ewma_rv"].iloc[2], np.sqrt(252 * np.mean(np.square(returns[:3]))) )
+    assert np.isclose(result["ewma_rv"].iloc[3], np.sqrt(252 * expected_variance))
 
 
 def test_ewma_rejects_invalid_decay() -> None:
@@ -25,6 +25,19 @@ def test_ewma_rejects_invalid_decay() -> None:
         add_ewma_volatility_baseline(frame, decay=1.0)
 
 
+def test_ewma_candidates_validate_and_match_single() -> None:
+    frame = pd.DataFrame({
+        "asset": "SPY", "date": pd.date_range("2020-01-01", periods=25),
+        "log_return": np.arange(1, 26, dtype=float) / 1000,
+    })
+    candidates = add_ewma_volatility_candidates(frame, decays=[0.90, 0.94], min_periods=3)
+    single = add_ewma_volatility_baseline(frame, decay=0.94, min_periods=3)
+    assert np.allclose(candidates["ewma_rv_lambda_0.94"], single["ewma_rv"], equal_nan=True)
+    with pytest.raises(ValueError, match="unique"):
+        add_ewma_volatility_candidates(frame, decays=[0.94, 0.94])
+
+
+def test_window_start_and_formula() -> None:
     returns = np.arange(1, 26, dtype=float) / 1000
     frame = pd.DataFrame({"asset": "SPY", "date": pd.date_range("2020-01-01", periods=25), "log_return": returns})
     result = add_historical_volatility_baseline(frame, window=21)

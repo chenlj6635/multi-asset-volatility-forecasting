@@ -21,18 +21,39 @@ data:
   context_assets:
     "^VIX": VIX.csv
 
+walk_forward:
+  train_end: "2021-12-31"
+  validation_end: "2023-12-31"
+
+dm_test:
+  enabled: true
+  losses: [qlike, mae]
+  primary_loss: qlike
+  hac_lag: 4
+
 calculation:
   annualization_factor: 252
   label_horizon: 5
   baseline_window: 21
   ewma_lambda: 0.94
+  ewma_lambdas: [0.90, 0.94, 0.97, 0.99]
   ewma_min_periods: 21
   qlike_epsilon: 1.0e-12
+  forecast_variance_floor: 1.0e-4
   extreme_return_threshold: 0.20
   long_gap_days: 7
 
 outputs:
   predictions: data/processed/baseline_predictions.parquet
   metrics: outputs/tables/baseline_metrics.csv
+  walk_forward_metrics: outputs/tables/walk_forward_metrics.csv
+  dm_tests: outputs/tables/dm_tests.csv
+  ewma_lambda_selection: outputs/tables/ewma_lambda_selection.csv
+  har_coefficients: outputs/tables/har_coefficients.csv
+  har_vix_coefficients: outputs/tables/har_vix_coefficients.csv
+  test_model_comparison: outputs/tables/test_model_comparison.csv
+  vix_incremental_comparison: outputs/tables/vix_incremental_comparison.csv
+  asset_robustness: outputs/tables/asset_robustness.csv
+  regime_robustness: outputs/tables/regime_robustness.csv
   metadata: outputs/tables/run_metadata.json
   figure: outputs/figures/spy_baseline_vs_actual.png

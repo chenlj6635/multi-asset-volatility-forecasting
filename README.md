@@ -100,12 +100,33 @@ This writes:
 - `data/quality/quality_summary.json`
 - `data/processed/baseline_predictions.parquet`
 - `outputs/tables/baseline_metrics.csv`
+- `outputs/tables/walk_forward_metrics.csv`
+- `outputs/tables/dm_tests.csv`
+- `outputs/tables/har_coefficients.csv`
 - `outputs/tables/run_metadata.json`
 - `outputs/figures/spy_baseline_vs_actual.png`
 
 The metadata records raw-file SHA-256 hashes, the strict label interval, variance-scale QLIKE, configuration, and row counts.
 
-## Tests
+## Walk-forward evaluation
+
+Forecast dates are split into three configured segments: train through `2021-12-31`, validation from `2022-01-01` through `2023-12-31`, and test from `2024-01-01` onward. The last five forecast dates per asset are removed from train and validation so their `t+1` through `t+5` label windows cannot cross a segment boundary. Historical rolling and EWMA states are computed continuously from prior observations and are not restarted at validation or test boundaries. Segment, asset, forecast, and pooled `ALL` metrics are written to `outputs/tables/walk_forward_metrics.csv`.
+
+## Diebold-Mariano comparison
+
+The EWMA and historical baselines are compared using paired QLIKE losses. The differential is defined as `loss_ewma - loss_historical`, so a negative value favors EWMA. For pooled `ALL`, loss differences are first averaged across valid assets on each date; the resulting date series is then sorted and evaluated with Bartlett/Newey-West HAC lag 4. This avoids treating different assets as adjacent time observations. Results by segment, asset, and pooled `ALL` are written to `outputs/tables/dm_tests.csv`; a p-value indicates evidence against equal mean loss, not a guarantee of future superiority.
+
+## Loss sensitivity
+
+QLIKE is the primary DM loss and is evaluated on the variance scale. MAE is also evaluated on the volatility scale as a sensitivity analysis. Both use `loss_ewma - loss_historical`, the same paired observations, date-level pooled `ALL` aggregation, and HAC lag 4. In the test segment pooled `ALL` result, QLIKE has mean difference `-0.039615`, DM statistic `-2.909619`, and p-value `0.003619`; MAE has mean difference `-0.000996`, DM statistic `-0.842524`, and p-value `0.399495`.
+
+## EWMA lambda selection
+
+Candidate EWMA lambdas `0.90`, `0.94`, `0.97`, and `0.99` are evaluated using only validation-segment pooled QLIKE. The selected lambda is `0.94`; ties would be resolved deterministically in favor of the smaller lambda. After validation selection, the chosen EWMA forecast is locked before test evaluation. Candidate scores and the selected flag are written to `outputs/tables/ewma_lambda_selection.csv`; test observations are not used for lambda selection.
+
+Test-regime robustness is written to `outputs/tables/regime_robustness.csv`. Regimes are defined only for the test segment using pooled future five-day realized-volatility tertiles; they are descriptive and do not affect fitting or model selection. In pooled `ALL`, the historical baseline ranks best in low volatility, while HAR-RV ranks best across MAE, RMSE, and QLIKE in medium and high volatility.
+
+The HAR-RV baseline uses daily, five-day, and 22-day historical squared-return features available through each forecast date. It fits one OLS model per asset on the cleaned train segment only, with `future_rv_5d^2` as the variance-scale target. Coefficients are locked before validation and test evaluation; negative variance forecasts are clipped at zero before taking the square root. Predictions and metrics include `har_rv`, and coefficients are written to `outputs/tables/har_coefficients.csv`.
 
 ```bash
 python -m pytest -q

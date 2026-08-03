@@ -69,6 +69,12 @@ def write_quality_report(table: pd.DataFrame, summary: Mapping[str, Any], output
     (output / "quality_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
+def write_metrics(metrics: pd.DataFrame, output_path: str | Path) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics.to_csv(output_path, index=False)
+
+
 def write_results(
     predictions: pd.DataFrame,
     metrics: pd.DataFrame,
