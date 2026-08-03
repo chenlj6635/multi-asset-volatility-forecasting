@@ -34,6 +34,7 @@ from src.evaluation import (
 from src.features import add_ewma_volatility_candidates, add_har_features, add_historical_volatility_baseline, add_vix_level, fit_har_vix_by_asset
 from src.labels import add_future_realized_volatility, add_log_returns
 from src.metrics import metrics_by_asset
+from src.models import fit_garch_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_metrics, write_quality_report, write_results
 
 
@@ -142,14 +143,24 @@ def build(config_path: str | Path) -> dict[str, Any]:
     predictions["har_vix_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["har_vix_rv"].to_numpy()
     predictions["log_vix_z"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["log_vix_z"].to_numpy()
     predictions["har_vix_logvar"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["har_vix_logvar"].to_numpy()
+    garch_config = calculation.get("garch", {}) or {}
+    segmented, garch_params = fit_garch_by_asset(
+        segmented,
+        horizon=int(calculation["label_horizon"]),
+        annualization_factor=float(calculation["annualization_factor"]),
+        p=int(garch_config.get("p", 1)),
+        q=int(garch_config.get("q", 1)),
+        min_train_observations=int(garch_config.get("min_train_observations", 120)),
+    )
+    predictions["garch_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["garch_rv"].to_numpy()
     metrics = metrics_by_asset(
         predictions,
-        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "har_vix_rv"),
+        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"),
         epsilon=float(calculation["qlike_epsilon"]),
     )
     walk_metrics = walk_forward_metrics(
         segmented,
-        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "har_vix_rv"),
+        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"),
         epsilon=float(calculation["qlike_epsilon"]),
     )
     comparison = pd.concat([
@@ -163,6 +174,8 @@ def build(config_path: str | Path) -> dict[str, Any]:
     dm_results = pd.concat([
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="ewma_rv", model_b_column="historical_rv_21d"),
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="har_rv", model_b_column="historical_rv_21d"),
+        dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="garch_rv", model_b_column="historical_rv_21d"),
+        dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="garch_rv", model_b_column="har_rv"),
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="har_vix_rv", model_b_column="har_rv"),
     ], ignore_index=True) if bool(dm_config.get("enabled", True)) else pd.DataFrame()
     vix_incremental = dm_results.loc[(dm_results["model_a"] == "har_vix_rv") & (dm_results["model_b"] == "har_rv")].copy()
@@ -207,10 +220,23 @@ def build(config_path: str | Path) -> dict[str, Any]:
             "coefficient_columns": list(har_coefficients.columns),
             "forecast_column": "har_rv",
         },
+        "garch": {
+            "enabled": bool(garch_config.get("enabled", True)),
+            "model": f"GARCH({int(garch_config.get('p', 1))},{int(garch_config.get('q', 1))})",
+            "mean": "Constant",
+            "distribution": "normal",
+            "target": "five-day iterated conditional variance",
+            "parameter_lock": "train_segment_mle",
+            "forecast_rule": "fixed coefficients, recursive filter, iterated 5-step",
+            "stationary_assets": int((garch_params["stationary"] == True).sum()) if not garch_params.empty else 0,
+            "parameter_output": outputs["garch_params"],
+            "parameter_assets": int(len(garch_params)),
+            "forecast_column": "garch_rv",
+        },
         "regime_robustness": {
             "definition": "test future_rv_5d pooled tertiles",
             "thresholds": regime_thresholds,
-            "models": ["historical_rv_21d", "ewma_rv", "har_rv"],
+            "models": ["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv"],
             "output": outputs["regime_robustness"],
         },
         "vix_incremental": {
@@ -237,14 +263,14 @@ def build(config_path: str | Path) -> dict[str, Any]:
             "coefficient_assets": int(len(har_vix_coefficients)),
             "forecast_column": "har_vix_rv",
         },
-        "forecast_columns": ["historical_rv_21d", "ewma_rv", "har_rv", "har_vix_rv"],
+        "forecast_columns": ["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"],
         "qlike_scale": "variance",
         "raw_files": raw_files,
         "quality_status": quality_summary["status"],
         "prediction_rows": int(len(predictions)),
         "valid_evaluation_rows": {
             column: int(predictions[["future_rv_5d", column]].notna().all(axis=1).sum())
-            for column in ["historical_rv_21d", "ewma_rv", "har_rv", "har_vix_rv"]
+            for column in ["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"]
         },
         "ewma_lambda_selection": lambda_selection.to_dict(orient="records"),
         "dm_test": {
@@ -254,7 +280,8 @@ def build(config_path: str | Path) -> dict[str, Any]:
             "comparisons": [
                 {"model_a": "ewma_rv", "model_b": "historical_rv_21d"},
                 {"model_a": "har_rv", "model_b": "historical_rv_21d"},
-                {"model_a": "har_rv", "model_b": "ewma_rv"},
+                {"model_a": "garch_rv", "model_b": "historical_rv_21d"},
+                {"model_a": "garch_rv", "model_b": "har_rv"},
                 {"model_a": "har_vix_rv", "model_b": "har_rv"},
             ],
             "pooled_rule": "cross-sectional mean by date before HAC",
@@ -278,7 +305,7 @@ def build(config_path: str | Path) -> dict[str, Any]:
                         & (walk_metrics["asset"] == "ALL"),
                         "n_obs",
                     ].iloc[0])
-                    for forecast in ["historical_rv_21d", "ewma_rv", "har_rv"]
+                    for forecast in ["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv"]
                 }
                 for segment in ["train", "validation", "test"]
             },
@@ -296,6 +323,7 @@ def build(config_path: str | Path) -> dict[str, Any]:
     write_metrics(lambda_selection, resolve(root, outputs["ewma_lambda_selection"]))
     write_metrics(har_coefficients, resolve(root, outputs["har_coefficients"]))
     write_metrics(har_vix_coefficients, resolve(root, outputs["har_vix_coefficients"]))
+    write_metrics(garch_params, resolve(root, outputs["garch_params"]))
     write_metrics(comparison, resolve(root, outputs["test_model_comparison"]))
     write_metrics(robustness, resolve(root, outputs["asset_robustness"]))
     write_metrics(regime_robustness, resolve(root, outputs["regime_robustness"]))

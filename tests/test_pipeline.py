@@ -66,6 +66,12 @@ def make_config(tmp_path: Path) -> Path:
             "forecast_variance_floor": 1e-4,
             "extreme_return_threshold": 0.20,
             "long_gap_days": 7,
+            "garch": {
+                "enabled": True,
+                "p": 1,
+                "q": 1,
+                "min_train_observations": 10,
+            },
         },
         "outputs": {
             "predictions": str(tmp_path / "processed/predictions.parquet"),
@@ -75,6 +81,7 @@ def make_config(tmp_path: Path) -> Path:
             "ewma_lambda_selection": str(tmp_path / "outputs/ewma_lambda_selection.csv"),
             "har_coefficients": str(tmp_path / "outputs/har_coefficients.csv"),
             "har_vix_coefficients": str(tmp_path / "outputs/har_vix_coefficients.csv"),
+            "garch_params": str(tmp_path / "outputs/garch_params.csv"),
             "test_model_comparison": str(tmp_path / "outputs/test_model_comparison.csv"),
             "vix_incremental_comparison": str(tmp_path / "outputs/vix_incremental_comparison.csv"),
             "asset_robustness": str(tmp_path / "outputs/asset_robustness.csv"),
@@ -103,6 +110,7 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
         tmp_path / "outputs/ewma_lambda_selection.csv",
         tmp_path / "outputs/har_coefficients.csv",
         tmp_path / "outputs/har_vix_coefficients.csv",
+        tmp_path / "outputs/garch_params.csv",
         tmp_path / "outputs/test_model_comparison.csv",
         tmp_path / "outputs/vix_incremental_comparison.csv",
         tmp_path / "outputs/asset_robustness.csv",
@@ -113,21 +121,21 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
     assert all(path.exists() and path.stat().st_size > 0 for path in expected)
     predictions = pd.read_parquet(expected[2])
     assert set(predictions.asset) == set(ASSETS[:-1])
-    assert {"historical_rv_21d", "ewma_rv", "har_rv", "har_vix_rv"}.issubset(predictions.columns)
+    assert {"historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"}.issubset(predictions.columns)
     assert predictions.groupby("asset")["future_rv_5d"].tail(5).isna().all()
     metrics = pd.read_csv(expected[3])
-    assert metrics.asset.tolist() == ["GLD", "IWM", "QQQ", "SPY", "TLT", "USO", "ALL"] * 4
-    assert set(metrics.forecast) == {"historical_rv_21d", "ewma_rv", "har_rv", "har_vix_rv"}
+    assert metrics.asset.tolist() == ["GLD", "IWM", "QQQ", "SPY", "TLT", "USO", "ALL"] * 5
+    assert set(metrics.forecast) == {"historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"}
     assert np.isfinite(metrics[["mae", "rmse", "qlike"]].to_numpy()).all()
     walk_metrics = pd.read_csv(expected[4])
     assert set(walk_metrics.segment) == {"train", "validation", "test"}
-    assert set(walk_metrics.forecast) == {"historical_rv_21d", "ewma_rv", "har_rv", "har_vix_rv"}
+    assert set(walk_metrics.forecast) == {"historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"}
     dm = pd.read_csv(expected[5])
     assert set(dm.segment) == {"train", "validation", "test"}
     assert set(dm.asset) == set(ASSETS[:-1]) | {"ALL"}
     assert {"n_dates", "paired_rows"}.issubset(dm.columns)
     assert set(dm.loss) == {"qlike", "mae"}
-    assert len(dm) == 90
+    assert len(dm) == 150
     selection = pd.read_csv(expected[6])
     assert len(selection) == 4
     assert selection.selected.sum() == 1
@@ -135,11 +143,13 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
     coefficients = pd.read_csv(expected[7])
     vix_coefficients = pd.read_csv(expected[8])
     assert set(vix_coefficients.asset) == set(ASSETS[:-1])
-    comparison = pd.read_csv(expected[9])
-    vix_incremental = pd.read_csv(expected[10])
+    garch_params = pd.read_csv(expected[9])
+    assert set(garch_params.asset) == set(ASSETS[:-1])
+    comparison = pd.read_csv(expected[10])
+    vix_incremental = pd.read_csv(expected[11])
     assert set(vix_incremental["model_a"]) == {"har_vix_rv"}
     assert set(vix_incremental["model_b"]) == {"har_rv"}
-    saved_metadata = json.loads(expected[13].read_text())
+    saved_metadata = json.loads(expected[14].read_text())
     assert saved_metadata["qlike_scale"] == "variance"
     assert saved_metadata["dm_test"]["primary_loss"] == "qlike"
     assert saved_metadata["dm_test"]["losses"] == ["qlike", "mae"]

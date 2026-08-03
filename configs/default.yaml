@@ -42,6 +42,11 @@ calculation:
   forecast_variance_floor: 1.0e-4
   extreme_return_threshold: 0.20
   long_gap_days: 7
+  garch:
+    enabled: true
+    p: 1
+    q: 1
+    min_train_observations: 120
   har_vix:
     enabled: true
     target: log_variance
@@ -56,6 +61,7 @@ outputs:
   ewma_lambda_selection: outputs/tables/ewma_lambda_selection.csv
   har_coefficients: outputs/tables/har_coefficients.csv
   har_vix_coefficients: outputs/tables/har_vix_coefficients.csv
+  garch_params: outputs/tables/garch_params.csv
   test_model_comparison: outputs/tables/test_model_comparison.csv
   vix_incremental_comparison: outputs/tables/vix_incremental_comparison.csv
   asset_robustness: outputs/tables/asset_robustness.csv

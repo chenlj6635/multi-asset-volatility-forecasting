@@ -6,7 +6,7 @@ A leakage-controlled, offline-reproducible Week 1 research baseline for forecast
 
 Can volatility information available at the close of day `t` improve forecasts of realized volatility over trading days `t+1` through `t+5`, and can later improvements translate into better risk control?
 
-This first milestone implements the historical-volatility and EWMA baselines plus the HAR-RV statistical baseline and an experimental HAR-VIX variant. It covers SPY, QQQ, IWM, TLT, GLD, and USO. `^VIX` is downloaded and quality-checked as a context series and is used only in the experimental VIX-incremental comparison, not in the headline baseline metrics.
+This first milestone implements the historical-volatility and EWMA baselines plus the HAR-RV statistical baseline, the GARCH(1,1) conditional-volatility model, and an experimental HAR-VIX variant. It covers SPY, QQQ, IWM, TLT, GLD, and USO. `^VIX` is downloaded and quality-checked as a context series and is used only in the experimental VIX-incremental comparison, not in the headline baseline metrics.
 
 ## Definitions
 
@@ -105,6 +105,7 @@ This writes:
 - `outputs/tables/ewma_lambda_selection.csv`
 - `outputs/tables/har_coefficients.csv`
 - `outputs/tables/har_vix_coefficients.csv`
+- `outputs/tables/garch_params.csv`
 - `outputs/tables/test_model_comparison.csv`
 - `outputs/tables/vix_incremental_comparison.csv`
 - `outputs/tables/asset_robustness.csv`
@@ -120,7 +121,7 @@ Forecast dates are split into three configured segments: train through `2021-12-
 
 ## Diebold-Mariano comparison
 
-The EWMA and historical baselines are compared using paired QLIKE losses. The differential is defined as `loss_ewma - loss_historical`, so a negative value favors EWMA. For pooled `ALL`, loss differences are first averaged across valid assets on each date; the resulting date series is then sorted and evaluated with Bartlett/Newey-West HAC lag 4. This avoids treating different assets as adjacent time observations. Results by segment, asset, and pooled `ALL` are written to `outputs/tables/dm_tests.csv`; a p-value indicates evidence against equal mean loss, not a guarantee of future superiority.
+Pairs of model forecasts are compared using paired QLIKE losses, with MAE on the volatility scale as a sensitivity check. The differential is defined as `loss_model_a - loss_model_b`, so a negative value favors model A. For pooled `ALL`, loss differences are first averaged across valid assets on each date; the resulting date series is then sorted and evaluated with Bartlett/Newey-West HAC lag 4. This avoids treating different assets as adjacent time observations. Results by segment, asset, and pooled `ALL` are written to `outputs/tables/dm_tests.csv`; a p-value indicates evidence against equal mean loss, not a guarantee of future superiority.
 
 ## Loss sensitivity
 
@@ -130,11 +131,13 @@ QLIKE is the primary DM loss and is evaluated on the variance scale. MAE is also
 
 Candidate EWMA lambdas `0.90`, `0.94`, `0.97`, and `0.99` are evaluated using only validation-segment pooled QLIKE. The selected lambda is `0.94`; ties would be resolved deterministically in favor of the smaller lambda. After validation selection, the chosen EWMA forecast is locked before test evaluation. Candidate scores and the selected flag are written to `outputs/tables/ewma_lambda_selection.csv`; test observations are not used for lambda selection.
 
-Test-regime robustness is written to `outputs/tables/regime_robustness.csv`. Regimes are defined only for the test segment using pooled future five-day realized-volatility tertiles; they are descriptive and do not affect fitting or model selection. In pooled `ALL`, the historical baseline ranks best in low volatility, while HAR-RV ranks best across MAE, RMSE, and QLIKE in medium and high volatility.
+Test-regime robustness is written to `outputs/tables/regime_robustness.csv`. Regimes are defined only for the test segment using pooled future five-day realized-volatility tertiles; they are descriptive and do not affect fitting or model selection. In pooled `ALL`, the historical baseline ranks best in low volatility, while GARCH and HAR-RV rank best in medium and high volatility (GARCH wins MAE, HAR-RV wins RMSE and QLIKE).
 
 The HAR-RV baseline uses daily, five-day, and 22-day historical squared-return features available through each forecast date. It fits one OLS model per asset on the cleaned train segment only, with `future_rv_5d^2` as the variance-scale target. Coefficients are locked before validation and test evaluation; negative variance forecasts are clipped at zero before taking the square root. Predictions and metrics include `har_rv`, and coefficients are written to `outputs/tables/har_coefficients.csv`.
 
 The experimental HAR-VIX variant adds the same-day log VIX level to the HAR features. Because a linear model on the variance scale can imply negative variance, HAR-VIX is instead fitted on `log(future_rv_5d^2)` and recovered with an exponential plus a lognormal smearing term (`0.5 * sigma^2` from training residuals), so predictions are always strictly positive and no clipping is required. Standardization and coefficients are locked from the train segment. In the pooled `ALL` comparison, VIX improves QLIKE within train and validation (train mean loss difference `-0.033712`, DM statistic `-4.373`, p `0.0000`; validation `-0.040212`, DM `-3.136`, p `0.0017`) but the advantage does not persist out of sample: test mean loss difference `+0.013485`, DM `+0.863`, p `0.388`. The test result is heterogeneous across assets — SPY improves significantly (p `0.005`) while GLD degrades significantly (p `0.007`), and the remaining assets are statistically indistinguishable. Incremental DM results are written to `outputs/tables/vix_incremental_comparison.csv` and coefficients to `outputs/tables/har_vix_coefficients.csv`. This comparison is treated as evidence about the role of implied volatility rather than as part of the headline baseline comparison.
+
+The GARCH(1,1) model uses Gaussian maximum likelihood on centered returns, fitted once per asset on the train segment only. Returns are scaled by the training-sample standard deviation before estimation for optimizer conditioning, and `omega` and `mu` are rescaled back so all parameters (`omega`, `alpha`, `beta`, `mu`) are locked before validation and test evaluation. The fitted coefficients then act as a fixed conditional-variance filter: the recursive variance path continues through validation and test using only past observations, and the five-day forecast iterates `h_k = omega + (alpha + beta) * h_{k-1}` from the one-step-ahead variance. Parameters, including the `alpha + beta` persistence and the optimizer convergence flag, are written to `outputs/tables/garch_params.csv`; all six assets fit with stationary (persistence < 1) and converged parameters in the current run. In the test segment pooled `ALL` result, GARCH has MAE `0.063940`, RMSE `0.097671`, and QLIKE `-2.304942`, the lowest among the formal models. Its QLIKE advantage over the historical baseline is significant (test mean difference `-0.073286`, DM `-3.720`, p `0.0002`), while the smaller edge over HAR-RV (`-0.004014`, DM `-0.630`, p `0.529`) is not statistically significant. Per-asset first places in the test segment are split between GARCH and HAR-RV, with EWMA winning a minority.
 
 ```bash
 python -m pytest -q
@@ -156,4 +159,4 @@ All tests use synthetic local data and require no network. They verify exact lab
 
 ## Limitations
 
-The future five-day RV label is a noisy proxy constructed from daily squared returns and overlaps across adjacent rows. Yahoo Finance can revise history and may impose throttling or availability limits. Adjusted close and raw OHLC are on different adjustment bases, so raw range estimators require additional care in later milestones. The project is descriptive rather than a fully walk-forward-trained model family and does not yet include GARCH, Ridge/Lasso, tree models, range-based labels, non-overlapping-label inference, strategy execution, or portfolio allocation.
+The future five-day RV label is a noisy proxy constructed from daily squared returns and overlaps across adjacent rows. Yahoo Finance can revise history and may impose throttling or availability limits. Adjusted close and raw OHLC are on different adjustment bases, so raw range estimators require additional care in later milestones. The project is descriptive rather than a fully walk-forward-trained model family and does not yet include Ridge/Lasso, tree models, range-based labels, non-overlapping-label inference, strategy execution, or portfolio allocation.
