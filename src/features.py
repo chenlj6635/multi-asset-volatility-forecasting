@@ -57,26 +57,76 @@ def add_vix_level(frame: pd.DataFrame, vix_frame: pd.DataFrame, *, output_column
     return data
 
 
-def fit_har_vix_by_asset(frame: pd.DataFrame, *, output_column: str = "har_vix_rv", variance_floor: float = 1e-12) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fit train-only HAR-X OLS with train-standardized same-day log VIX."""
-    if variance_floor <= 0: raise ValueError("variance_floor must be positive")
+def _train_log_variance(actual: np.ndarray, floor: float) -> np.ndarray:
+    return np.log(np.maximum(np.square(actual), floor))
+
+
+def fit_har_vix_by_asset(
+    frame: pd.DataFrame,
+    *,
+    output_column: str = "har_vix_rv",
+    log_floor: float = 1e-12,
+    smearing: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit train-only HAR-X OLS on log variance with train-standardized log VIX.
+
+    The target is ``log(future_rv_5d^2)``, so a linear prediction in log space
+    can never imply a negative variance and no zero-clipping is required. An
+    optional lognormal smearing term ``0.5 * sigma^2`` (estimated from training
+    residuals) levels the recovered variance expectation before converting back
+    to volatility scale. Coefficients, standardization, and the smearing term
+    are all locked from the train segment only.
+    """
+    if log_floor <= 0:
+        raise ValueError("log_floor must be positive")
     features = ["har_daily_rv", "har_weekly_rv", "har_monthly_rv", "log_vix_z"]
-    data = frame.copy(); data[output_column] = np.nan; data["har_vix_variance_raw"] = np.nan; rows = []
+    data = frame.copy()
+    data[output_column] = np.nan
+    data["har_vix_logvar"] = np.nan
+    rows: list[dict[str, float | int | str]] = []
     train_vix = data.loc[(data["segment"] == "train") & data["log_vix"].notna(), "log_vix"]
     mean, std = float(train_vix.mean()), float(train_vix.std(ddof=0))
-    if not np.isfinite(mean) or not np.isfinite(std) or std <= 0: raise ValueError("training log VIX standard deviation must be positive")
+    if not np.isfinite(mean) or not np.isfinite(std) or std <= 0:
+        raise ValueError("training log VIX standard deviation must be positive")
     data["log_vix_z"] = (data["log_vix"] - mean) / std
     for asset, group in data.groupby("asset", sort=True):
-        train = group.loc[(group["segment"] == "train") & group[["future_rv_5d", *features]].notna().all(axis=1)]
-        if len(train) < len(features) + 1: raise ValueError(f"insufficient HAR-VIX training observations for {asset}")
-        x = np.column_stack([np.ones(len(train)), train[features].to_numpy()]); y = np.square(train["future_rv_5d"].to_numpy())
+        train = group.loc[
+            (group["segment"] == "train")
+            & group[["future_rv_5d", *features]].notna().all(axis=1)
+        ]
+        if len(train) < len(features) + 1:
+            raise ValueError(f"insufficient HAR-VIX training observations for {asset}")
+        x = np.column_stack([np.ones(len(train)), train[features].to_numpy()])
+        y = _train_log_variance(train["future_rv_5d"].to_numpy(), floor=log_floor)
         beta, *_ = np.linalg.lstsq(x, y, rcond=None)
+        sigma2 = float(np.mean(np.square(y - x.dot(beta))))
+        smearing_offset = 0.5 * sigma2 if smearing else 0.0
         valid = group[features].notna().all(axis=1)
-        raw = np.column_stack([np.ones(int(valid.sum())), group.loc[valid, features].to_numpy()]).dot(beta)
-        clipped = np.maximum(np.where(np.isfinite(raw), raw, variance_floor), variance_floor)
-        data.loc[group.index[valid], "har_vix_variance_raw"] = raw
-        data.loc[group.index[valid], output_column] = np.sqrt(clipped)
-        rows.append({"asset": asset, "intercept": beta[0], "daily": beta[1], "weekly": beta[2], "monthly": beta[3], "log_vix_z": beta[4], "n_train": len(train), "negative_variance_prediction_count": int(np.sum(raw < variance_floor)), "nonfinite_prediction_count": int(np.sum(~np.isfinite(raw))), "vix_missing_train_count": int(group.loc[group["segment"] == "train", "log_vix"].isna().sum()), "vix_mean_train": mean, "vix_std_train": std})
+        predictor = np.column_stack(
+            [np.ones(int(valid.sum())), group.loc[valid, features].to_numpy()]
+        )
+        logvar = predictor.dot(beta) + smearing_offset
+        variance = np.exp(logvar)
+        data.loc[group.index[valid], "har_vix_logvar"] = logvar
+        data.loc[group.index[valid], output_column] = np.sqrt(variance)
+        rows.append({
+            "asset": asset,
+            "intercept": beta[0],
+            "daily": beta[1],
+            "weekly": beta[2],
+            "monthly": beta[3],
+            "log_vix_z": beta[4],
+            "smearing_variance": sigma2,
+            "smearing_offset": smearing_offset,
+            "n_train": len(train),
+            "below_floor_count": int(np.sum(variance < 1e-8)),
+            "nonfinite_prediction_count": int(np.sum(~np.isfinite(variance))),
+            "vix_missing_train_count": int(
+                group.loc[group["segment"] == "train", "log_vix"].isna().sum()
+            ),
+            "vix_mean_train": mean,
+            "vix_std_train": std,
+        })
     return data, pd.DataFrame(rows)
 def add_har_features(frame: pd.DataFrame, *, return_column: str = "log_return", annualization_factor: float = 252.0, daily_column: str = "har_daily_rv", weekly_column: str = "har_weekly_rv", monthly_column: str = "har_monthly_rv") -> pd.DataFrame:
     if annualization_factor <= 0: raise ValueError("annualization_factor must be positive")

@@ -133,10 +133,15 @@ def build(config_path: str | Path) -> dict[str, Any]:
     predictions["ewma_rv"] = predictions[selected_column]
     segmented, har_coefficients = fit_har_by_asset(segmented)
     predictions["har_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["har_rv"].to_numpy()
-    segmented, har_vix_coefficients = fit_har_vix_by_asset(segmented, variance_floor=float(calculation["forecast_variance_floor"]))
+    har_vix_config = calculation.get("har_vix", {}) or {}
+    segmented, har_vix_coefficients = fit_har_vix_by_asset(
+        segmented,
+        log_floor=float(har_vix_config.get("log_floor", 1.0e-12)),
+        smearing=bool(har_vix_config.get("smearing", True)),
+    )
     predictions["har_vix_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["har_vix_rv"].to_numpy()
     predictions["log_vix_z"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["log_vix_z"].to_numpy()
-    predictions["har_vix_variance_raw"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["har_vix_variance_raw"].to_numpy()
+    predictions["har_vix_logvar"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["har_vix_logvar"].to_numpy()
     metrics = metrics_by_asset(
         predictions,
         forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "har_vix_rv"),
@@ -215,14 +220,16 @@ def build(config_path: str | Path) -> dict[str, Any]:
             "experimental_only": True,
         },
         "har_vix": {
-            "enabled": True,
+            "enabled": bool(har_vix_config.get("enabled", True)),
             "alignment": "exact_date_left_join",
             "source_asset": "^VIX",
             "source_column": "adj_close",
             "feature_column": "log_vix_z",
             "raw_feature_column": "log_vix",
             "standardization": "train_global_mean_std",
-            "variance_floor": calculation["forecast_variance_floor"],
+            "target": "log variance of future_rv_5d",
+            "log_floor": float(har_vix_config.get("log_floor", 1.0e-12)),
+            "smearing_correction": bool(har_vix_config.get("smearing", True)),
             "missing_policy": "retain_nan_no_future_fill",
             "training_segment": "train",
             "parameters_locked": True,

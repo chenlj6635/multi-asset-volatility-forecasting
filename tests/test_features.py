@@ -5,7 +5,12 @@ import pandas as pd
 import pandas.testing as pdt
 import pytest
 
-from src.features import add_ewma_volatility_baseline, add_ewma_volatility_candidates, add_historical_volatility_baseline
+from src.features import (
+    add_ewma_volatility_baseline,
+    add_ewma_volatility_candidates,
+    add_historical_volatility_baseline,
+    fit_har_vix_by_asset,
+)
 
 
 def test_ewma_formula_and_start() -> None:
@@ -68,3 +73,55 @@ def test_unsorted_and_sorted_inputs_match() -> None:
     expected = add_historical_volatility_baseline(sorted_frame).reset_index(drop=True)
     actual = add_historical_volatility_baseline(frame.sample(frac=1, random_state=7)).reset_index(drop=True)
     pdt.assert_frame_equal(actual, expected)
+
+
+def _har_vix_frame(seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2019-01-01", periods=810)
+    rows = []
+    for asset, base in (("A", 0.10), ("B", 0.18)):
+        for date in dates:
+            daily = base / np.sqrt(252) + abs(float(rng.normal(0, 0.002)))
+            vix = float(rng.normal(28.0 if asset == "A" else 20.0, 3.0))
+            segment = (
+                "train" if date <= pd.Timestamp("2020-11-30")
+                else "validation" if date <= pd.Timestamp("2021-01-31")
+                else "test"
+            )
+            rows.append({
+                "asset": asset,
+                "date": date,
+                "segment": segment,
+                "future_rv_5d": base + abs(float(rng.normal(0, 0.01))),
+                "har_daily_rv": max(daily * daily, 1e-8),
+                "har_weekly_rv": max(base ** 2 / 252 * 5, 1e-8),
+                "har_monthly_rv": max(base ** 2 / 252 * 22, 1e-8),
+                "log_vix": np.log(max(vix, 5.0)),
+            })
+    return pd.DataFrame(rows)
+
+
+def test_har_vix_log_variance_model_never_clips_and_smearing_raises_level() -> None:
+    frame = _har_vix_frame()
+    with_smear, coefficients = fit_har_vix_by_asset(frame, smearing=True)
+    without, _ = fit_har_vix_by_asset(frame, smearing=False)
+    assert with_smear["har_vix_rv"].notna().all()
+    assert (with_smear["har_vix_rv"] > 0).all()
+    assert (with_smear["har_vix_rv"] < 5).all()
+    assert "har_vix_logvar" in with_smear.columns
+    assert set(coefficients["asset"]) == {"A", "B"}
+    assert {"smearing_variance", "smearing_offset"}.issubset(coefficients.columns)
+    assert (coefficients["below_floor_count"] == 0).all()
+    assert (coefficients["nonfinite_prediction_count"] == 0).all()
+    means_with = with_smear.groupby("asset")["har_vix_rv"].mean()
+    means_without = without.groupby("asset")["har_vix_rv"].mean()
+    assert (means_with > means_without).all()
+
+
+def test_har_vix_rejects_invalid_floor_and_requires_train_rows() -> None:
+    frame = _har_vix_frame()
+    with pytest.raises(ValueError, match="log_floor"):
+        fit_har_vix_by_asset(frame, log_floor=0.0)
+    no_train = frame.loc[frame["segment"] != "train"].copy()
+    with pytest.raises(ValueError, match="log VIX standard deviation"):
+        fit_har_vix_by_asset(no_train)
