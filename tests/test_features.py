@@ -9,6 +9,8 @@ from src.features import (
     add_ewma_volatility_baseline,
     add_ewma_volatility_candidates,
     add_historical_volatility_baseline,
+    add_market_state_features,
+    add_range_features,
     fit_har_vix_by_asset,
 )
 
@@ -125,3 +127,62 @@ def test_har_vix_rejects_invalid_floor_and_requires_train_rows() -> None:
     no_train = frame.loc[frame["segment"] != "train"].copy()
     with pytest.raises(ValueError, match="log VIX standard deviation"):
         fit_har_vix_by_asset(no_train)
+
+
+def _ohlc_frame(rows: int = 22, high_multiplier: float = 1.01) -> pd.DataFrame:
+    close = 100.0 + np.arange(rows, dtype=float)
+    return pd.DataFrame({
+        "asset": "SPY",
+        "date": pd.date_range("2020-01-01", periods=rows, freq="B"),
+        "open": close * 0.999,
+        "high": close * high_multiplier,
+        "low": close * 0.99,
+        "close": close,
+    })
+
+
+def test_parkinson_and_garman_klass_warm_up_and_formula() -> None:
+    frame = _ohlc_frame(rows=6)
+    result = add_range_features(frame, windows=(5,))
+    parkinson_day = 0.5 * np.square(np.log(1.01 / 0.99))
+    assert result["parkinson_5d"].iloc[:4].isna().all()
+    assert result["parkinson_5d"].iloc[4] == pytest.approx(252.0 * parkinson_day)
+    gk_day = 0.5 * np.square(np.log(1.01 / 0.99)) - (2.0 * np.log(2.0) - 1.0) * np.square(np.log(1.0 / 0.999))
+    assert result["garman_klass_5d"].iloc[4] == pytest.approx(252.0 * gk_day)
+
+
+def test_range_features_do_not_share_rolling_windows() -> None:
+    rows = 6
+    frame = pd.concat([
+        _ohlc_frame(rows=rows, high_multiplier=1.2),
+        _ohlc_frame(rows=rows, high_multiplier=1.05),
+    ], ignore_index=True)
+    frame["asset"] = ["A"] * rows + ["B"] * rows
+    result = add_range_features(frame, windows=(5,))
+    high = result.loc[result["asset"] == "A", "parkinson_5d"]
+    low = result.loc[result["asset"] == "B", "parkinson_5d"]
+    assert high.iloc[-1] > low.iloc[-1]
+
+
+def test_market_state_features_warm_up_and_values() -> None:
+    rows = 25
+    frame = pd.DataFrame({
+        "asset": "SPY",
+        "date": pd.date_range("2020-01-01", periods=rows, freq="B"),
+        "log_return": np.full(rows, 0.01),
+        "close": 100.0 + np.arange(rows, dtype=float),
+        "volume": np.full(rows, 1_000_000.0),
+        "log_vix": np.full(rows, np.log(18.0)),
+    })
+    result = add_market_state_features(frame, window=21, short_window=5)
+    assert result["rel_return_5d"].iloc[:4].isna().all()
+    assert result["rel_return_5d"].iloc[4] == pytest.approx(5 * 0.01)
+    assert result["downside_frac_21d"].iloc[20] == 0.0
+    assert result["volume_ratio_21d"].iloc[20] == pytest.approx(0.0)
+    assert result["drawdown_21d"].iloc[20] == pytest.approx(0.0)
+    assert result["close_to_ma_21d"].iloc[24] == pytest.approx(
+        result["close"].iloc[24] / result["close"].iloc[4:25].mean() - 1.0
+    )
+    assert (result["vix_change_5d"].iloc[:4].isna()).all()
+    assert result["vix_change_5d"].iloc[5] == pytest.approx(0.0)
+    assert result["rel_return_21d"].iloc[:20].isna().all()

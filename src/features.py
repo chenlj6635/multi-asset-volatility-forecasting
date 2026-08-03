@@ -128,6 +128,98 @@ def fit_har_vix_by_asset(
             "vix_std_train": std,
         })
     return data, pd.DataFrame(rows)
+
+
+def add_range_features(
+    frame: pd.DataFrame,
+    *,
+    annualization_factor: float = 252.0,
+    windows: tuple[int, ...] = (5, 22),
+) -> pd.DataFrame:
+    """Add Parkinson and Garman-Klass annualized variance features per asset.
+
+    Both estimators use log(High/Low) and log(Close/Open) ratios, which are
+    invariant to the unadjusted/adjusted basis, so they can be computed from the
+    raw OHLC fields. The output features are on the annualized variance scale to
+    match the HAR daily features. Rolling windows never cross asset boundaries.
+    """
+    if annualization_factor <= 0:
+        raise ValueError("annualization_factor must be positive")
+    if not all(window >= 1 for window in windows):
+        raise ValueError("windows must be positive")
+    data = frame.sort_values(["asset", "date"], kind="stable").copy()
+    high = pd.to_numeric(data["high"], errors="coerce")
+    low = pd.to_numeric(data["low"], errors="coerce")
+    close = pd.to_numeric(data["close"], errors="coerce")
+    open_ = pd.to_numeric(data["open"], errors="coerce")
+    valid = (high > 0) & (low > 0) & (close > 0) & (open_ > 0) & (low <= high)
+    parkinson_day = np.where(valid, 0.5 * np.square(np.log(high / low)), np.nan)
+    garman_klass_day = np.where(
+        valid,
+        0.5 * np.square(np.log(high / low))
+        - (2.0 * np.log(2.0) - 1.0) * np.square(np.log(close / open_)),
+        np.nan,
+    )
+    data["_parkinson_day"] = parkinson_day
+    data["_garman_klass_day"] = garman_klass_day
+    for window in windows:
+        data[f"parkinson_{window}d"] = annualization_factor * data.groupby(
+            "asset", sort=False
+        )["_parkinson_day"].transform(
+            lambda values: values.rolling(window, min_periods=window).mean()
+        )
+        data[f"garman_klass_{window}d"] = annualization_factor * data.groupby(
+            "asset", sort=False
+        )["_garman_klass_day"].transform(
+            lambda values: values.rolling(window, min_periods=window).mean()
+        )
+    return data.drop(columns=["_parkinson_day", "_garman_klass_day"])
+
+
+def add_market_state_features(
+    frame: pd.DataFrame,
+    *,
+    return_column: str = "log_return",
+    close_column: str = "close",
+    volume_column: str = "volume",
+    window: int = 21,
+    short_window: int = 5,
+) -> pd.DataFrame:
+    """Add return, trend, drawdown, volume, and VIX-change features per asset.
+
+    All features use only information available through the forecast date and
+    rolling windows never cross asset boundaries. The VIX change requires the
+    same-day ``log_vix`` column to already be present (e.g. from add_vix_level).
+    """
+    if window <= 0 or short_window <= 0:
+        raise ValueError("windows must be positive")
+    data = frame.sort_values(["asset", "date"], kind="stable").copy()
+    grouped = data.groupby("asset", sort=False)
+    data["rel_return_5d"] = grouped[return_column].transform(
+        lambda values: values.rolling(short_window, min_periods=short_window).sum()
+    )
+    data["rel_return_21d"] = grouped[return_column].transform(
+        lambda values: values.rolling(window, min_periods=window).sum()
+    )
+    data["downside_frac_21d"] = grouped[return_column].transform(
+        lambda values: (values < 0).rolling(window, min_periods=window).mean()
+    )
+    data["close_to_ma_21d"] = grouped[close_column].transform(
+        lambda values: values / values.rolling(window, min_periods=window).mean() - 1.0
+    )
+    data["drawdown_21d"] = grouped[close_column].transform(
+        lambda values: values / values.rolling(window, min_periods=window).max() - 1.0
+    )
+    volume = pd.to_numeric(data[volume_column], errors="coerce").replace(0.0, np.nan)
+    volume_mean = grouped[volume_column].transform(
+        lambda values: values.replace(0.0, np.nan).rolling(window, min_periods=window).mean()
+    )
+    data["volume_ratio_21d"] = volume / volume_mean - 1.0
+    if "log_vix" in data.columns:
+        data["vix_change_5d"] = grouped["log_vix"].transform(
+            lambda values: values.diff(short_window)
+        )
+    return data
 def add_har_features(frame: pd.DataFrame, *, return_column: str = "log_return", annualization_factor: float = 252.0, daily_column: str = "har_daily_rv", weekly_column: str = "har_weekly_rv", monthly_column: str = "har_monthly_rv") -> pd.DataFrame:
     if annualization_factor <= 0: raise ValueError("annualization_factor must be positive")
     data = frame.sort_values(["asset", "date"], kind="stable").copy()

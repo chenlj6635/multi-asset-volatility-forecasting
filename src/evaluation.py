@@ -232,7 +232,7 @@ def dm_by_segment(
 def test_model_comparison(frame: pd.DataFrame, *, segment: str = "test", asset: str | None = None) -> pd.DataFrame:
     """Return test-segment model metrics with per-metric ranks."""
     data = frame.loc[frame["segment"] == segment]
-    metrics = walk_forward_metrics(data, forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "garch_rv"))
+    metrics = walk_forward_metrics(data, forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"))
     metrics = metrics.loc[(metrics["segment"] == segment) & (metrics["asset"] == (asset or "ALL"))].copy()
     for metric in ("mae", "rmse"):
         metrics[f"{metric}_rank"] = metrics[metric].rank(method="min", ascending=True).astype("Int64")
@@ -251,7 +251,7 @@ def assign_test_volatility_regimes(frame: pd.DataFrame, *, actual_column: str = 
     return data, {"low_threshold": low, "high_threshold": high}
 
 
-def regime_robustness_summary(frame: pd.DataFrame, *, models: tuple[str, ...] = ("historical_rv_21d", "ewma_rv", "har_rv", "garch_rv")) -> pd.DataFrame:
+def regime_robustness_summary(frame: pd.DataFrame, *, models: tuple[str, ...] = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv")) -> pd.DataFrame:
     """Evaluate formal models by test volatility regime, asset, and pooled ALL."""
     rows = []
     for regime in ("low", "medium", "high"):
@@ -266,7 +266,7 @@ def regime_robustness_summary(frame: pd.DataFrame, *, models: tuple[str, ...] = 
     return result[["regime", "asset", "forecast", "n_obs", "mae", "rmse", "qlike", "variance_floor_count", "mae_rank", "rmse_rank", "qlike_rank"]]
 
 
-def asset_robustness_summary(frame: pd.DataFrame, *, segment: str = "test", models: tuple[str, ...] = ("historical_rv_21d", "ewma_rv", "har_rv", "garch_rv")) -> pd.DataFrame:
+def asset_robustness_summary(frame: pd.DataFrame, *, segment: str = "test", models: tuple[str, ...] = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv")) -> pd.DataFrame:
     metrics = walk_forward_metrics(frame, forecast_columns=models)
     metrics = metrics.loc[(metrics["segment"] == segment) & (metrics["asset"] != "ALL")].copy()
     for metric in ("mae", "rmse", "qlike"):

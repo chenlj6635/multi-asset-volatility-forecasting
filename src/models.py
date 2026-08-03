@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.metrics import evaluate_forecast
+
 
 def _garch_recursive_forecast(
     returns: np.ndarray,
@@ -154,3 +156,213 @@ def fit_garch_by_asset(
             "nonfinite_forecast_count": int(np.sum(~np.isfinite(forecast))),
         })
     return data, pd.DataFrame(rows)
+
+
+def _soft_threshold(value: np.ndarray | float, threshold: float) -> np.ndarray | float:
+    return np.sign(value) * np.maximum(np.abs(value) - threshold, 0.0)
+
+
+def _fit_ridge_ls(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    l2: float,
+) -> tuple[np.ndarray, float]:
+    """Ridge least squares on standardized columns; intercept unpenalized."""
+    y_centered = y - float(y.mean())
+    if l2 <= 0:
+        beta, *_ = np.linalg.lstsq(x, y_centered, rcond=None)
+    else:
+        beta = np.linalg.solve(x.T @ x + l2 * np.eye(x.shape[1]), x.T @ y_centered)
+    return np.asarray(beta, dtype=float), float(y.mean())
+
+
+def _fit_lasso_cd(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    l1: float,
+    max_iter: int = 5000,
+    tolerance: float = 1e-6,
+) -> tuple[np.ndarray, float]:
+    """Coordinate-descent LASSO on standardized columns; intercept unpenalized."""
+    observations, predictors = x.shape
+    beta = np.zeros(predictors)
+    y_centered = y - float(y.mean())
+    residual = y_centered - x @ beta
+    for _ in range(max_iter):
+        beta_old = beta.copy()
+        for j in range(predictors):
+            residual = residual + beta[j] * x[:, j]
+            rho = float(x[:, j] @ residual)
+            scale = float(x[:, j] @ x[:, j])
+            if scale <= 0:
+                continue
+            beta[j] = float(_soft_threshold(rho, l1)) / scale
+            residual = residual - beta[j] * x[:, j]
+        if np.max(np.abs(beta - beta_old)) < tolerance:
+            break
+    return beta, float(y.mean())
+
+
+def fit_ridge_by_asset(
+    frame: pd.DataFrame,
+    *,
+    feature_columns: list[str] | tuple[str, ...],
+    actual_column: str = "future_rv_5d",
+    output_column: str = "ridge_rv",
+    penalty: str = "ridge",
+    lambda_grid: list[float] | tuple[float, ...],
+    train_segment: str = "train",
+    validation_segment: str = "validation",
+    target_mode: str = "log_variance",
+    log_floor: float = 1.0e-12,
+    variance_floor: float = 1.0e-4,
+    epsilon: float = 1.0e-12,
+    min_train_observations: int = 120,
+    min_validation_observations: int = 20,
+    lasso_max_iter: int = 5000,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fit a penalized linear model per asset with validation-selected penalty.
+
+    Features are z-scored using the train segment per asset; the penalty lambda
+    is selected per asset on the validation segment by pooled QLIKE (ties resolve
+    to the smallest lambda, i.e. the least regularized model); and coefficients
+    are refit on the train segment with the chosen lambda before scoring any
+    segment. With ``target_mode="log_variance"`` (default) the model fits
+    ``log(future_rv_5d^2)`` and forecasts are recovered exponentially, so
+    variance forecasts are always strictly positive; with ``target_mode="variance"``
+    raw variance forecasts below ``variance_floor`` are clipped and counted.
+    """
+    if penalty not in ("ridge", "lasso"):
+        raise ValueError("penalty must be 'ridge' or 'lasso'")
+    if target_mode not in ("log_variance", "variance"):
+        raise ValueError("target_mode must be 'log_variance' or 'variance'")
+    if log_floor <= 0:
+        raise ValueError("log_floor must be positive")
+    values = [float(value) for value in lambda_grid]
+    if not values or not all(np.isfinite(values)):
+        raise ValueError("lambda_grid must be a non-empty list of finite values")
+    if min_train_observations <= 0 or min_validation_observations <= 0:
+        raise ValueError("minimum observation counts must be positive")
+    if variance_floor <= 0:
+        raise ValueError("variance_floor must be positive")
+
+    feature_columns = list(feature_columns)
+    data = frame.sort_values(["asset", "date"], kind="stable").copy()
+    data[output_column] = np.nan
+    parameter_rows: list[dict[str, float | int | str]] = []
+    selection_rows: list[dict[str, float | int | str | bool]] = []
+
+    for asset, group in data.groupby("asset", sort=True):
+        train = group.loc[
+            (group["segment"] == train_segment)
+            & group[[actual_column, *feature_columns]].notna().all(axis=1)
+        ]
+        validation = group.loc[
+            (group["segment"] == validation_segment)
+            & group[[actual_column, *feature_columns]].notna().all(axis=1)
+        ]
+        if len(train) < min_train_observations or len(validation) < min_validation_observations:
+            parameter_rows.append({
+                "asset": asset, "penalty": penalty, "selected_lambda": np.nan,
+                "intercept": np.nan, "n_train": int(len(train)),
+                "n_validation": int(len(validation)), "validation_qlike": np.nan,
+                "status": "insufficient_observations",
+                **{name: np.nan for name in feature_columns},
+            })
+            continue
+
+        train_x = train[feature_columns].to_numpy(dtype=float)
+        train_actual = train[actual_column].to_numpy(dtype=float)
+        if target_mode == "log_variance":
+            train_y = np.log(np.maximum(np.square(train_actual), log_floor))
+        else:
+            train_y = np.square(train_actual)
+        feature_mean = np.nanmean(train_x, axis=0)
+        feature_std = np.nanstd(train_x, axis=0)
+        feature_std[~np.isfinite(feature_std)] = 1.0
+        feature_std[feature_std <= 1e-12] = 1.0
+
+        def scale(values: pd.DataFrame | np.ndarray) -> np.ndarray:
+            return (np.asarray(values, dtype=float) - feature_mean) / feature_std
+
+        train_x_scaled = scale(train_x)
+        validation_x = validation[feature_columns].to_numpy(dtype=float)
+        validation_x_scaled = scale(validation_x)
+        validation_actual_vol = validation[actual_column].to_numpy(dtype=float)
+
+        best_lambda: float | None = None
+        best_qlike = np.inf
+        for candidate in values:
+            if penalty == "ridge":
+                beta, intercept = _fit_ridge_ls(train_x_scaled, train_y, l2=candidate)
+            else:
+                beta, intercept = _fit_lasso_cd(
+                    train_x_scaled, train_y, l1=candidate, max_iter=lasso_max_iter
+                )
+            smearing = 0.0
+            if target_mode == "log_variance":
+                fitted_train = intercept + train_x_scaled @ beta
+                smearing = 0.5 * float(np.mean(np.square(train_y - fitted_train)))
+            raw_validation = intercept + validation_x_scaled @ beta + smearing
+            if target_mode == "log_variance":
+                raw_validation = np.exp(raw_validation)
+            forecast_vol = np.sqrt(np.maximum(raw_validation, variance_floor))
+            qlike = evaluate_forecast(
+                validation_actual_vol, forecast_vol, epsilon=epsilon
+            ).qlike
+            selection_rows.append({
+                "asset": asset, "penalty": penalty, "lambda": candidate,
+                "validation_qlike": qlike, "n_validation": int(len(validation)),
+                "selected": False,
+            })
+            if np.isfinite(qlike) and (best_lambda is None or qlike < best_qlike):
+                best_qlike = float(qlike)
+                best_lambda = candidate
+        if best_lambda is None:
+            parameter_rows.append({
+                "asset": asset, "penalty": penalty, "selected_lambda": np.nan,
+                "intercept": np.nan, "n_train": int(len(train)),
+                "n_validation": int(len(validation)), "validation_qlike": np.nan,
+                "status": "no_valid_candidate",
+                **{name: np.nan for name in feature_columns},
+            })
+            continue
+        # mark exactly one lambda as selected (ties already resolved to first minimum)
+        for row in selection_rows:
+            if row["asset"] == asset and row["penalty"] == penalty and row["lambda"] == best_lambda:
+                row["selected"] = True
+
+        if penalty == "ridge":
+            beta, intercept = _fit_ridge_ls(train_x_scaled, train_y, l2=best_lambda)
+        else:
+            beta, intercept = _fit_lasso_cd(
+                train_x_scaled, train_y, l1=best_lambda, max_iter=lasso_max_iter
+            )
+        smearing_offset = 0.0
+        if target_mode == "log_variance":
+            fitted_train = intercept + train_x_scaled @ beta
+            smearing_offset = 0.5 * float(np.mean(np.square(train_y - fitted_train)))
+        valid = group[feature_columns].notna().all(axis=1)
+        raw_all = intercept + scale(group.loc[valid, feature_columns].to_numpy(dtype=float)) @ beta
+        if target_mode == "log_variance":
+            raw_all = np.exp(raw_all + smearing_offset)
+        variance_clipped = np.maximum(raw_all, variance_floor)
+        data.loc[group.index[valid], output_column] = np.sqrt(variance_clipped)
+        parameter_rows.append({
+            "asset": asset, "penalty": penalty, "selected_lambda": best_lambda,
+            "intercept": intercept, "smearing_offset": smearing_offset,
+            "n_train": int(len(train)),
+            "n_validation": int(len(validation)), "validation_qlike": best_qlike,
+            "status": "ok",
+            **{name: float(coef) for name, coef in zip(feature_columns, beta)},
+        })
+
+    selection = pd.DataFrame(selection_rows)
+    params = pd.DataFrame(parameter_rows)
+    column_order = [
+        "asset", "penalty", "selected_lambda", "intercept", "smearing_offset",
+        "n_train", "n_validation", "validation_qlike", "status", *feature_columns,
+    ]
+    return data, params[[column for column in column_order if column in params.columns]], selection

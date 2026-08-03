@@ -31,10 +31,18 @@ from src.evaluation import (
     test_model_comparison,
     walk_forward_metrics,
 )
-from src.features import add_ewma_volatility_candidates, add_har_features, add_historical_volatility_baseline, add_vix_level, fit_har_vix_by_asset
+from src.features import (
+    add_ewma_volatility_candidates,
+    add_har_features,
+    add_historical_volatility_baseline,
+    add_market_state_features,
+    add_range_features,
+    add_vix_level,
+    fit_har_vix_by_asset,
+)
 from src.labels import add_future_realized_volatility, add_log_returns
 from src.metrics import metrics_by_asset
-from src.models import fit_garch_by_asset
+from src.models import fit_garch_by_asset, fit_ridge_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_metrics, write_quality_report, write_results
 
 
@@ -107,12 +115,22 @@ def build(config_path: str | Path) -> dict[str, Any]:
         annualization_factor=float(calculation["annualization_factor"]),
     )
     target_data = add_vix_level(target_data, market_data.loc[market_data["asset"] == "^VIX"])
+    target_data = add_range_features(target_data, annualization_factor=float(calculation["annualization_factor"]))
+    target_data = add_market_state_features(target_data)
     candidate_lambdas = tuple(float(value) for value in calculation["ewma_lambdas"])
     candidate_columns = [f"ewma_rv_lambda_{value:g}" for value in candidate_lambdas]
-    prediction_columns = [
-        "asset", "date", "adj_close", "log_return", "future_rv_5d", "historical_rv_21d", *candidate_columns,
-        "har_daily_rv", "har_weekly_rv", "har_monthly_rv", "log_vix",
+    ridge_config = calculation.get("ridge", {}) or {}
+    ridge_feature_columns = [
+        "har_daily_rv", "har_weekly_rv", "har_monthly_rv",
+        "parkinson_5d", "parkinson_22d", "garman_klass_22d",
+        "rel_return_5d", "rel_return_21d", "downside_frac_21d",
+        "close_to_ma_21d", "drawdown_21d", "volume_ratio_21d",
+        "log_vix", "vix_change_5d",
     ]
+    prediction_columns = list(dict.fromkeys([
+        "asset", "date", "adj_close", "log_return", "future_rv_5d", "historical_rv_21d", *candidate_columns,
+        "har_daily_rv", "har_weekly_rv", "har_monthly_rv", "log_vix", *ridge_feature_columns,
+    ]))
     predictions = target_data[prediction_columns].reset_index(drop=True)
     walk_config = config["walk_forward"]
     segmented = assign_walk_forward_segments(
@@ -153,14 +171,30 @@ def build(config_path: str | Path) -> dict[str, Any]:
         min_train_observations=int(garch_config.get("min_train_observations", 120)),
     )
     predictions["garch_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["garch_rv"].to_numpy()
+    ridge_penalty = str(ridge_config.get("penalty", "ridge"))
+    ridge_grid = [float(value) for value in ridge_config.get(
+        "lasso_lambda_grid" if ridge_penalty == "lasso" else "lambda_grid",
+        [0.0, 0.01, 0.1, 1.0, 10.0, 100.0] if ridge_penalty == "ridge" else [0.0, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1],
+    )]
+    segmented, ridge_params, ridge_selection = fit_ridge_by_asset(
+        segmented,
+        feature_columns=ridge_feature_columns,
+        penalty=ridge_penalty,
+        lambda_grid=ridge_grid,
+        variance_floor=float(calculation["forecast_variance_floor"]),
+        epsilon=float(calculation["qlike_epsilon"]),
+        min_train_observations=int(ridge_config.get("min_train_observations", 120)),
+        min_validation_observations=int(ridge_config.get("min_validation_observations", 20)),
+    )
+    predictions["ridge_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["ridge_rv"].to_numpy()
     metrics = metrics_by_asset(
         predictions,
-        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"),
+        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"),
         epsilon=float(calculation["qlike_epsilon"]),
     )
     walk_metrics = walk_forward_metrics(
         segmented,
-        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"),
+        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"),
         epsilon=float(calculation["qlike_epsilon"]),
     )
     comparison = pd.concat([
@@ -176,6 +210,9 @@ def build(config_path: str | Path) -> dict[str, Any]:
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="har_rv", model_b_column="historical_rv_21d"),
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="garch_rv", model_b_column="historical_rv_21d"),
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="garch_rv", model_b_column="har_rv"),
+        dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="ridge_rv", model_b_column="historical_rv_21d"),
+        dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="ridge_rv", model_b_column="har_rv"),
+        dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="ridge_rv", model_b_column="garch_rv"),
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="har_vix_rv", model_b_column="har_rv"),
     ], ignore_index=True) if bool(dm_config.get("enabled", True)) else pd.DataFrame()
     vix_incremental = dm_results.loc[(dm_results["model_a"] == "har_vix_rv") & (dm_results["model_b"] == "har_rv")].copy()
@@ -233,10 +270,28 @@ def build(config_path: str | Path) -> dict[str, Any]:
             "parameter_assets": int(len(garch_params)),
             "forecast_column": "garch_rv",
         },
+        "ridge": {
+            "enabled": bool(ridge_config.get("enabled", True)),
+            "penalty": ridge_penalty,
+            "target": "log variance of future_rv_5d (exponential recovery)",
+            "standardization": "per_asset_train_zscore",
+            "lambda_selection": "per asset, validation pooled QLIKE",
+            "tie_break": "smallest lambda",
+            "feature_columns": ridge_feature_columns,
+            "n_features": len(ridge_feature_columns),
+            "min_train_observations": int(ridge_config.get("min_train_observations", 120)),
+            "min_validation_observations": int(ridge_config.get("min_validation_observations", 20)),
+            "variance_floor": float(calculation["forecast_variance_floor"]),
+            "parameters_locked": True,
+            "parameter_output": outputs["ridge_params"],
+            "selection_output": outputs["ridge_lambda_selection"],
+            "parameter_assets": int(len(ridge_params)),
+            "forecast_column": "ridge_rv",
+        },
         "regime_robustness": {
             "definition": "test future_rv_5d pooled tertiles",
             "thresholds": regime_thresholds,
-            "models": ["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv"],
+            "models": ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"],
             "output": outputs["regime_robustness"],
         },
         "vix_incremental": {
@@ -263,14 +318,14 @@ def build(config_path: str | Path) -> dict[str, Any]:
             "coefficient_assets": int(len(har_vix_coefficients)),
             "forecast_column": "har_vix_rv",
         },
-        "forecast_columns": ["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"],
+        "forecast_columns": ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"],
         "qlike_scale": "variance",
         "raw_files": raw_files,
         "quality_status": quality_summary["status"],
         "prediction_rows": int(len(predictions)),
         "valid_evaluation_rows": {
             column: int(predictions[["future_rv_5d", column]].notna().all(axis=1).sum())
-            for column in ["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "har_vix_rv"]
+            for column in ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"]
         },
         "ewma_lambda_selection": lambda_selection.to_dict(orient="records"),
         "dm_test": {
@@ -282,6 +337,9 @@ def build(config_path: str | Path) -> dict[str, Any]:
                 {"model_a": "har_rv", "model_b": "historical_rv_21d"},
                 {"model_a": "garch_rv", "model_b": "historical_rv_21d"},
                 {"model_a": "garch_rv", "model_b": "har_rv"},
+                {"model_a": "ridge_rv", "model_b": "historical_rv_21d"},
+                {"model_a": "ridge_rv", "model_b": "har_rv"},
+                {"model_a": "ridge_rv", "model_b": "garch_rv"},
                 {"model_a": "har_vix_rv", "model_b": "har_rv"},
             ],
             "pooled_rule": "cross-sectional mean by date before HAC",
@@ -305,7 +363,7 @@ def build(config_path: str | Path) -> dict[str, Any]:
                         & (walk_metrics["asset"] == "ALL"),
                         "n_obs",
                     ].iloc[0])
-                    for forecast in ["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv"]
+                    for forecast in ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"]
                 }
                 for segment in ["train", "validation", "test"]
             },
@@ -324,6 +382,8 @@ def build(config_path: str | Path) -> dict[str, Any]:
     write_metrics(har_coefficients, resolve(root, outputs["har_coefficients"]))
     write_metrics(har_vix_coefficients, resolve(root, outputs["har_vix_coefficients"]))
     write_metrics(garch_params, resolve(root, outputs["garch_params"]))
+    write_metrics(ridge_params, resolve(root, outputs["ridge_params"]))
+    write_metrics(ridge_selection, resolve(root, outputs["ridge_lambda_selection"]))
     write_metrics(comparison, resolve(root, outputs["test_model_comparison"]))
     write_metrics(robustness, resolve(root, outputs["asset_robustness"]))
     write_metrics(regime_robustness, resolve(root, outputs["regime_robustness"]))

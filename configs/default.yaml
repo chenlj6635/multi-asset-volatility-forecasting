@@ -47,6 +47,29 @@ calculation:
     p: 1
     q: 1
     min_train_observations: 120
+  ridge:
+    enabled: true
+    penalty: ridge
+    feature_columns:
+      - har_daily_rv
+      - har_weekly_rv
+      - har_monthly_rv
+      - parkinson_5d
+      - parkinson_22d
+      - garman_klass_22d
+      - rel_return_5d
+      - rel_return_21d
+      - downside_frac_21d
+      - close_to_ma_21d
+      - drawdown_21d
+      - volume_ratio_21d
+      - log_vix
+      - vix_change_5d
+    variance_floor: 1.0e-4
+    min_train_observations: 120
+    min_validation_observations: 20
+    lambda_grid: [0.0, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+    lasso_lambda_grid: [0.0, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
   har_vix:
     enabled: true
     target: log_variance
@@ -62,6 +85,8 @@ outputs:
   har_coefficients: outputs/tables/har_coefficients.csv
   har_vix_coefficients: outputs/tables/har_vix_coefficients.csv
   garch_params: outputs/tables/garch_params.csv
+  ridge_params: outputs/tables/ridge_params.csv
+  ridge_lambda_selection: outputs/tables/ridge_lambda_selection.csv
   test_model_comparison: outputs/tables/test_model_comparison.csv
   vix_incremental_comparison: outputs/tables/vix_incremental_comparison.csv
   asset_robustness: outputs/tables/asset_robustness.csv
