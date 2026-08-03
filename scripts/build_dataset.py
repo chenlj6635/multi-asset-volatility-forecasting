@@ -44,6 +44,7 @@ from src.labels import add_future_realized_volatility, add_log_returns
 from src.metrics import metrics_by_asset
 from src.models import fit_garch_by_asset, fit_ridge_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_metrics, write_quality_report, write_results
+from src.strategy import portfolio_metrics, transmission_waterfall, vol_targeting_metrics
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -217,6 +218,56 @@ def build(config_path: str | Path) -> dict[str, Any]:
     ], ignore_index=True) if bool(dm_config.get("enabled", True)) else pd.DataFrame()
     vix_incremental = dm_results.loc[(dm_results["model_a"] == "har_vix_rv") & (dm_results["model_b"] == "har_rv")].copy()
     vix_diagnostics = segmented.groupby("segment").agg(vix_nonmissing=("log_vix", "count"), vix_missing=("log_vix", lambda values: int(values.isna().sum())), log_vix_z_nonmissing=("log_vix_z", "count"), log_vix_z_missing=("log_vix_z", lambda values: int(values.isna().sum()))).reset_index()
+    strategy_config = config.get("strategy", {}) or {}
+    strategy_segment = str(strategy_config.get("evaluation_segment", "test"))
+    strategy_target_vol = float(strategy_config.get("target_vol", 0.10))
+    strategy_max_leverage = float(strategy_config.get("max_leverage", 1.5))
+    strategy_cost_bps = float(strategy_config.get("cost_bps", 10.0))
+    strategy_rebalance_every = int(strategy_config.get("rebalance_every", 5))
+    strategy_forecasters = [str(value) for value in strategy_config.get(
+        "forecasting_models", ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"]
+    )]
+    strategy_parts = []
+    for forecast in strategy_forecasters:
+        model_metrics = vol_targeting_metrics(
+            segmented,
+            segment=strategy_segment,
+            target_vol=strategy_target_vol,
+            max_leverage=strategy_max_leverage,
+            cost_bps=strategy_cost_bps,
+            forecast_column=forecast,
+        )
+        model_metrics["forecast"] = forecast
+        strategy_parts.append(model_metrics)
+    fixed_metrics = vol_targeting_metrics(
+        segmented,
+        segment=strategy_segment,
+        target_vol=strategy_target_vol,
+        max_leverage=None,
+        cost_bps=0.0,
+        fixed_weight=1.0,
+    )
+    fixed_metrics["forecast"] = "fixed_100pct"
+    strategy_parts.append(fixed_metrics)
+    strategy_metrics = pd.concat(strategy_parts, ignore_index=True)
+    transmission_table = transmission_waterfall(
+        segmented,
+        forecast_columns=tuple(strategy_forecasters),
+        segment=strategy_segment,
+        target_vol=strategy_target_vol,
+        max_leverage=strategy_max_leverage,
+        cost_bps=strategy_cost_bps,
+    )
+    portfolio_rows = []
+    for scheme in ("equal", "inverse_historical", "inverse_forecast"):
+        portfolio_rows.append(portfolio_metrics(
+            segmented,
+            segment=strategy_segment,
+            weight_scheme=scheme,
+            forecast_column="garch_rv" if scheme == "inverse_forecast" else None,
+            rebalance_every=strategy_rebalance_every,
+        ))
+    portfolio_table = pd.DataFrame(portfolio_rows)
     raw_files = {
         asset: {
             "path": str(raw_dir / filename),
@@ -349,6 +400,22 @@ def build(config_path: str | Path) -> dict[str, Any]:
             "asset_robustness_output": outputs["asset_robustness"],
             "regime_robustness_output": outputs["regime_robustness"],
         },
+        "strategy": {
+            "enabled": bool(strategy_config.get("enabled", True)),
+            "target_vol": strategy_target_vol,
+            "max_leverage": strategy_max_leverage,
+            "evaluation_segment": strategy_segment,
+            "cost_bps": strategy_cost_bps,
+            "position_rule": "close-of-t forecast, position held from t+1, no shorting",
+            "evaluation_rule": "test segment only; forecasters are parameter-locked",
+            "rebalance_every": strategy_rebalance_every,
+            "forecasters": strategy_forecasters,
+            "fixed_reference": "fixed_100pct",
+            "portfolio_schemes": ["equal", "inverse_historical", "inverse_forecast_garch_rv"],
+            "strategy_metrics_output": outputs["strategy_metrics"],
+            "transmission_output": outputs["transmission_waterfall"],
+            "portfolio_output": outputs["portfolio_metrics"],
+        },
         "walk_forward": {
             "train_end": str(walk_config["train_end"]),
             "validation_end": str(walk_config["validation_end"]),
@@ -388,6 +455,9 @@ def build(config_path: str | Path) -> dict[str, Any]:
     write_metrics(robustness, resolve(root, outputs["asset_robustness"]))
     write_metrics(regime_robustness, resolve(root, outputs["regime_robustness"]))
     write_metrics(vix_incremental, resolve(root, outputs["vix_incremental_comparison"]))
+    write_metrics(strategy_metrics, resolve(root, outputs["strategy_metrics"]))
+    write_metrics(transmission_table, resolve(root, outputs["transmission_waterfall"]))
+    write_metrics(portfolio_table, resolve(root, outputs["portfolio_metrics"]))
     if bool(dm_config.get("enabled", True)):
         write_metrics(dm_results, resolve(root, outputs["dm_tests"]))
     plot_spy_comparison(predictions, resolve(root, outputs["figure"]))
