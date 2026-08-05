@@ -45,6 +45,10 @@ strategy:
     - ridge_rv
     - garch_rv
 
+robustness:
+  enabled: true
+  cost_doubling_bps: 20
+
 calculation:
   annualization_factor: 252
   label_horizon: 5
@@ -104,6 +108,9 @@ outputs:
   strategy_metrics: outputs/tables/strategy_metrics.csv
   transmission_waterfall: outputs/tables/transmission_waterfall.csv
   portfolio_metrics: outputs/tables/portfolio_metrics.csv
+  alt_label_metrics: outputs/tables/alt_label_metrics.csv
+  alt_label_dm: outputs/tables/alt_label_dm.csv
+  strategy_cost_sensitivity: outputs/tables/strategy_cost_sensitivity.csv
   test_model_comparison: outputs/tables/test_model_comparison.csv
   vix_incremental_comparison: outputs/tables/vix_incremental_comparison.csv
   asset_robustness: outputs/tables/asset_robustness.csv

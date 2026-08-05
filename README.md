@@ -115,6 +115,9 @@ This writes:
 - `outputs/tables/strategy_metrics.csv`
 - `outputs/tables/transmission_waterfall.csv`
 - `outputs/tables/portfolio_metrics.csv`
+- `outputs/tables/alt_label_metrics.csv`
+- `outputs/tables/alt_label_dm.csv`
+- `outputs/tables/strategy_cost_sensitivity.csv`
 - `outputs/tables/run_metadata.json`
 - `outputs/figures/spy_baseline_vs_actual.png`
 
@@ -153,6 +156,15 @@ The forecast models are applied to a single-asset volatility-targeting strategy 
 The transmission decomposition (`outputs/tables/transmission_waterfall.csv`) adds frictions in order to isolate where forecast accuracy is or is not transferred. The `1.5` leverage cap is almost never binding and changes risk outcomes by less than one basis point; adding one further day of execution lag raises the average per-asset target deviation by roughly `0.05–0.14 pp`; charging 10 bps of cost trims net annualized return by about `0.7–1.2 pp` while leaving risk control unchanged. So in this design the main gap between the forecast and realized risk outcome is small and is driven by the forecast level itself rather than by the frictions.
 
 The weekly portfolio layer (`outputs/tables/portfolio_metrics.csv`) compares equal weighting, inverse-21-day-historical-volatility weighting, and inverse-GARCH-forecast weighting over the same test segment. Pure risk allocation, no return prediction. The inverse-forecast portfolio has the lowest realized volatility (`10.68%`), the lowest maximum drawdown (`10.7%`), the lowest volatility-of-volatility (`3.67 pp`), and the highest Sharpe (`1.69`), with the inverse-historical portfolio a close second (`10.76%`, `11.2%`, `3.88 pp`, Sharpe `1.64`) and equal weighting clearly behind (`12.35%`, `13.7%`, `5.33 pp`). The differences are modest and measured over a single test window, so they are treated as suggestive rather than definitive evidence that forecast-based risk allocation is more stable.
+
+## Robustness checks
+
+Four checks test whether the main conclusions survive changes to the label proxy, the training sample, the cost assumption, and the market-state split. Results are written to `outputs/tables/alt_label_metrics.csv`, `outputs/tables/alt_label_dm.csv`, `outputs/tables/strategy_cost_sensitivity.csv`, and for the 2020-free run to `outputs/robustness/ex2020/` (run `python scripts/build_dataset.py --exclude-year 2020 --output-prefix outputs/robustness/ex2020`).
+
+- **Alternative labels.** The fixed out-of-sample forecasts are re-scored against Parkinson and Garman-Klass range-based realized-volatility labels (using the same `t+1` to `t+5` window). Under the Parkinson label the main ranking is unchanged: GARCH and Ridge remain in an indistinguishable top tier with HAR (DM vs HAR p `0.27` and `0.43`). Under the Garman-Klass label the ordering splits: GARCH and Ridge are significantly better than HAR (p `0.002` and `0.011`), while HAR, whose OLS target is specifically the squared-return label, drops to last. HAR is therefore label-sensitive in a way that the return-process model (GARCH) and the regularized feature model (Ridge) are not.
+- **Training-sample sensitivity.** Re-running the pipeline with 2020 excluded from training (16,452 versus 17,970 training observations) changes the 2024+ ordering materially: Ridge becomes the best QLIKE model and is significantly better than HAR and GARCH (DM `-0.113` and `-0.065`, both p `< 0.01`), while HAR and GARCH degrade sharply (test MAE about `0.084-0.087` versus `0.064-0.065` when trained with 2020). The headline finding that the top tier is statistically indistinguishable therefore depends on the 2020 training regime and should be reported with that caveat.
+- **Cost doubling.** Doubling the transaction cost from 10 to 20 bps leaves realized volatility unchanged and trims net annualized return by about `0.5-1.2 pp`; the risk ranking and the transmission-decomposition conclusions are unchanged, and the lower-turnover GARCH forecast loses the least to costs.
+- **Market-state regimes** are already reported in `outputs/tables/regime_robustness.csv`.
 
 ```bash
 python -m pytest -q

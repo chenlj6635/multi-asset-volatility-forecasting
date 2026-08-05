@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from src.labels import add_future_realized_volatility
+from src.labels import add_future_realized_volatility, add_range_based_future_volatility
 
 
 def make_frame(returns: np.ndarray) -> pd.DataFrame:
@@ -41,3 +42,37 @@ def test_labels_are_isolated_by_asset() -> None:
     expected_b = np.sqrt((252 / 5) * np.square(np.arange(1, 6) / 10).sum())
     assert result.loc[result.asset == "A", "future_rv_5d"].iloc[0] == expected_a
     assert result.loc[result.asset == "B", "future_rv_5d"].iloc[0] == expected_b
+
+
+def _ohlc_frame(rows: int = 12) -> pd.DataFrame:
+    close = 100.0 + np.arange(rows, dtype=float)
+    return pd.DataFrame({
+        "asset": "SPY",
+        "date": pd.date_range("2020-01-01", periods=rows, freq="B"),
+        "open": close * 0.999,
+        "high": close * 1.01,
+        "low": close * 0.99,
+        "close": close,
+    })
+
+
+def test_range_based_labels_formula_and_missing_tail() -> None:
+    result = add_range_based_future_volatility(_ohlc_frame(12), horizon=5)
+    parkinson_day = 0.5 * np.square(np.log(1.01 / 0.99))
+    garman_klass_day = 0.5 * np.square(np.log(1.01 / 0.99)) - (2.0 * np.log(2.0) - 1.0) * np.square(np.log(1.0 / 0.999))
+    assert result["future_rv_parkinson_5d"].iloc[0] == pytest.approx(np.sqrt(252 * parkinson_day))
+    assert result["future_rv_garman_klass_5d"].iloc[0] == pytest.approx(np.sqrt(252 * garman_klass_day))
+    assert result["future_rv_parkinson_5d"].tail(5).isna().all()
+    assert result["future_rv_garman_klass_5d"].tail(5).isna().all()
+
+
+def test_range_based_labels_are_isolated_by_asset() -> None:
+    frame = pd.concat([
+        _ohlc_frame(8).assign(asset="A"),
+        _ohlc_frame(8).assign(asset="B"),
+    ], ignore_index=True)
+    frame.loc[frame["asset"] == "B", "high"] *= 1.2
+    result = add_range_based_future_volatility(frame)
+    a = result.loc[result["asset"] == "A", "future_rv_parkinson_5d"].iloc[0]
+    b = result.loc[result["asset"] == "B", "future_rv_parkinson_5d"].iloc[0]
+    assert a != b

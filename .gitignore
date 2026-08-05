@@ -24,3 +24,5 @@ outputs/figures/*
 !outputs/figures/.gitkeep
 outputs/tables/*
 !outputs/tables/.gitkeep
+outputs/robustness/*
+!outputs/robustness/.gitkeep

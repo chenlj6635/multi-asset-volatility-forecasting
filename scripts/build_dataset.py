@@ -40,7 +40,7 @@ from src.features import (
     add_vix_level,
     fit_har_vix_by_asset,
 )
-from src.labels import add_future_realized_volatility, add_log_returns
+from src.labels import add_future_realized_volatility, add_log_returns, add_range_based_future_volatility
 from src.metrics import metrics_by_asset
 from src.models import fit_garch_by_asset, fit_ridge_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_metrics, write_quality_report, write_results
@@ -57,6 +57,12 @@ def resolve(root: Path, configured_path: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
+def redirect_paths(paths: dict[str, str], prefix: str) -> dict[str, str]:
+    """Redirect configured output paths under a prefix (for robustness runs)."""
+    prefix = Path(prefix)
+    return {key: str(prefix / Path(value)) for key, value in paths.items()}
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -65,13 +71,23 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build(config_path: str | Path) -> dict[str, Any]:
+def build(
+    config_path: str | Path,
+    *,
+    exclude_years: tuple[int, ...] = (),
+    output_prefix: str | None = None,
+) -> dict[str, Any]:
     config_path = Path(config_path).resolve()
     config = load_config(config_path)
     root = config_path.parent.parent
-    data_config = config["data"]
+    data_config = dict(config["data"])
     calculation = config["calculation"]
-    outputs = config["outputs"]
+    outputs = dict(config["outputs"])
+    if output_prefix:
+        outputs = redirect_paths(outputs, output_prefix)
+        data_config["quality_dir"] = redirect_paths(
+            {"quality_dir": data_config["quality_dir"]}, output_prefix
+        )["quality_dir"]
 
     target_map = data_config["target_assets"]
     context_map = data_config.get("context_assets", {})
@@ -92,12 +108,20 @@ def build(config_path: str | Path) -> dict[str, Any]:
     write_quality_report(quality_table, quality_summary, resolve(root, data_config["quality_dir"]))
 
     target_data = market_data.loc[market_data["asset"].isin(target_map)].copy()
+    if exclude_years:
+        years = {int(year) for year in exclude_years}
+        target_data = target_data.loc[~target_data["date"].dt.year.isin(years)].copy()
     target_data = add_log_returns(target_data)
     target_data = add_future_realized_volatility(
         target_data,
         horizon=int(calculation["label_horizon"]),
         annualization_factor=float(calculation["annualization_factor"]),
         output_column="future_rv_5d",
+    )
+    target_data = add_range_based_future_volatility(
+        target_data,
+        horizon=int(calculation["label_horizon"]),
+        annualization_factor=float(calculation["annualization_factor"]),
     )
     target_data = add_historical_volatility_baseline(
         target_data,
@@ -129,7 +153,8 @@ def build(config_path: str | Path) -> dict[str, Any]:
         "log_vix", "vix_change_5d",
     ]
     prediction_columns = list(dict.fromkeys([
-        "asset", "date", "adj_close", "log_return", "future_rv_5d", "historical_rv_21d", *candidate_columns,
+        "asset", "date", "adj_close", "log_return", "future_rv_5d", "future_rv_parkinson_5d", "future_rv_garman_klass_5d",
+        "historical_rv_21d", *candidate_columns,
         "har_daily_rv", "har_weekly_rv", "har_monthly_rv", "log_vix", *ridge_feature_columns,
     ]))
     predictions = target_data[prediction_columns].reset_index(drop=True)
@@ -268,6 +293,60 @@ def build(config_path: str | Path) -> dict[str, Any]:
             rebalance_every=strategy_rebalance_every,
         ))
     portfolio_table = pd.DataFrame(portfolio_rows)
+    robustness_config = config.get("robustness", {}) or {}
+    alt_label_columns = [
+        column for column in ("future_rv_parkinson_5d", "future_rv_garman_klass_5d")
+        if column in segmented.columns
+    ]
+    alt_label_metrics_parts: list[pd.DataFrame] = []
+    alt_label_dm_parts: list[pd.DataFrame] = []
+    for label in alt_label_columns:
+        label_metrics = walk_forward_metrics(
+            segmented,
+            forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"),
+            actual_column=label,
+            epsilon=float(calculation["qlike_epsilon"]),
+        )
+        label_metrics["label"] = label
+        alt_label_metrics_parts.append(label_metrics)
+        for model_a in ("garch_rv", "ridge_rv"):
+            dm_part = dm_by_segment(
+                segmented,
+                max_lag=int(dm_config["hac_lag"]),
+                epsilon=float(calculation["qlike_epsilon"]),
+                losses=("qlike", "mae"),
+                model_a_column=model_a,
+                model_b_column="har_rv",
+                actual_column=label,
+            )
+            dm_part["label"] = label
+            alt_label_dm_parts.append(dm_part)
+    alt_label_metrics = pd.concat(alt_label_metrics_parts, ignore_index=True) if alt_label_metrics_parts else pd.DataFrame()
+    alt_label_dm = pd.concat(alt_label_dm_parts, ignore_index=True) if alt_label_dm_parts else pd.DataFrame()
+    cost_doubling_bps = float(robustness_config.get("cost_doubling_bps", 20.0))
+    cost_rows: list[dict[str, float | int | str]] = []
+    for forecast in strategy_forecasters:
+        for cost_bps in (strategy_cost_bps, cost_doubling_bps):
+            stage = vol_targeting_metrics(
+                segmented,
+                segment=strategy_segment,
+                target_vol=strategy_target_vol,
+                max_leverage=strategy_max_leverage,
+                extra_lag_days=1,
+                cost_bps=cost_bps,
+                forecast_column=forecast,
+            )
+            pooled = stage.loc[stage["asset"] == "ALL"].iloc[0]
+            cost_rows.append({
+                "forecast": forecast,
+                "cost_bps": cost_bps,
+                "net_annual_return": pooled["net_annual_return"],
+                "sharpe": pooled["sharpe"],
+                "realized_vol": pooled["realized_vol"],
+                "turnover": pooled["turnover"],
+                "total_cost": pooled["total_cost"],
+            })
+    cost_sensitivity = pd.DataFrame(cost_rows)
     raw_files = {
         asset: {
             "path": str(raw_dir / filename),
@@ -416,6 +495,20 @@ def build(config_path: str | Path) -> dict[str, Any]:
             "transmission_output": outputs["transmission_waterfall"],
             "portfolio_output": outputs["portfolio_metrics"],
         },
+        "robustness": {
+            "excluded_years": [int(year) for year in exclude_years],
+            "alternative_labels": alt_label_columns,
+            "alternative_label_test_all_qlike": {
+                label: dict(zip(sub["forecast"].to_list(), sub["qlike"].to_list()))
+                for label, sub in alt_label_metrics.loc[
+                    (alt_label_metrics["asset"] == "ALL") & (alt_label_metrics["segment"] == "test")
+                ].groupby("label")
+            } if not alt_label_metrics.empty else {},
+            "cost_doubling_bps": cost_doubling_bps,
+            "alt_label_metrics_output": outputs["alt_label_metrics"],
+            "alt_label_dm_output": outputs["alt_label_dm"],
+            "strategy_cost_sensitivity_output": outputs["strategy_cost_sensitivity"],
+        },
         "walk_forward": {
             "train_end": str(walk_config["train_end"]),
             "validation_end": str(walk_config["validation_end"]),
@@ -458,6 +551,11 @@ def build(config_path: str | Path) -> dict[str, Any]:
     write_metrics(strategy_metrics, resolve(root, outputs["strategy_metrics"]))
     write_metrics(transmission_table, resolve(root, outputs["transmission_waterfall"]))
     write_metrics(portfolio_table, resolve(root, outputs["portfolio_metrics"]))
+    if not alt_label_metrics.empty:
+        write_metrics(alt_label_metrics, resolve(root, outputs["alt_label_metrics"]))
+    if not alt_label_dm.empty:
+        write_metrics(alt_label_dm, resolve(root, outputs["alt_label_dm"]))
+    write_metrics(cost_sensitivity, resolve(root, outputs["strategy_cost_sensitivity"]))
     if bool(dm_config.get("enabled", True)):
         write_metrics(dm_results, resolve(root, outputs["dm_tests"]))
     plot_spy_comparison(predictions, resolve(root, outputs["figure"]))
@@ -467,8 +565,10 @@ def build(config_path: str | Path) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs/default.yaml")
+    parser.add_argument("--exclude-year", type=int, action="append", default=[], help="drop rows from this calendar year (repeatable)")
+    parser.add_argument("--output-prefix", type=str, default=None, help="redirect all outputs under this prefix (robustness runs)")
     args = parser.parse_args()
-    metadata = build(args.config)
+    metadata = build(args.config, exclude_years=tuple(args.exclude_year), output_prefix=args.output_prefix)
     print(json.dumps({"status": "ok", **metadata}, indent=2))
 
 
