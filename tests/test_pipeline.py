@@ -112,6 +112,7 @@ def make_config(tmp_path: Path) -> Path:
             "worst_error_dates": str(tmp_path / "outputs/worst_error_dates.csv"),
             "expanding_comparison": str(tmp_path / "outputs/expanding_comparison.csv"),
             "expanding_dm": str(tmp_path / "outputs/expanding_dm.csv"),
+            "expanding_params": str(tmp_path / "outputs/expanding_params.csv"),
             "test_model_comparison": str(tmp_path / "outputs/test_model_comparison.csv"),
             "vix_incremental_comparison": str(tmp_path / "outputs/vix_incremental_comparison.csv"),
             "asset_robustness": str(tmp_path / "outputs/asset_robustness.csv"),

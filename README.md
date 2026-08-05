@@ -121,6 +121,7 @@ This writes:
 - `outputs/tables/worst_error_dates.csv`
 - `outputs/tables/expanding_comparison.csv`
 - `outputs/tables/expanding_dm.csv`
+- `outputs/tables/expanding_params.csv`
 - `outputs/tables/test_model_comparison.csv`
 - `outputs/tables/vix_incremental_comparison.csv`
 - `outputs/tables/asset_robustness.csv`

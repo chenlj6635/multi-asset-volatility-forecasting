@@ -760,6 +760,8 @@ def build(
         write_metrics(expanding_comparison, resolve(root, outputs["expanding_comparison"]))
     if not expanding_dm.empty:
         write_metrics(expanding_dm, resolve(root, outputs["expanding_dm"]))
+    if not expanding_params.empty:
+        write_metrics(expanding_params, resolve(root, outputs["expanding_params"]))
     write_metrics(comparison, resolve(root, outputs["test_model_comparison"]))
     write_metrics(robustness, resolve(root, outputs["asset_robustness"]))
     write_metrics(regime_robustness, resolve(root, outputs["regime_robustness"]))
