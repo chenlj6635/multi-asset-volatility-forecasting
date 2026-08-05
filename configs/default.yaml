@@ -45,6 +45,14 @@ strategy:
     - ridge_rv
     - garch_rv
     - lgb_rv
+    - lgb_rv_cal
+
+calibration:
+  enabled: true
+  method: variance_rms
+  source_segment: validation
+  models:
+    - lgb_rv
 
 robustness:
   enabled: true

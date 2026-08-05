@@ -132,6 +132,65 @@ def vol_targeting_metrics(
     return pd.DataFrame(rows)
 
 
+def calibrate_forecast_level(
+    frame: pd.DataFrame,
+    *,
+    forecast_column: str,
+    output_column: str,
+    actual_column: str = "future_rv_5d",
+    source_segment: str = "validation",
+    method: str = "variance_rms",
+    min_observations: int = 30,
+) -> pd.DataFrame:
+    """Apply a per-asset level calibration to a volatility forecast.
+
+    A multiplicative scale factor is estimated on ``source_segment`` rows and
+    applied to every row, so the calibration uses only data available before the
+    evaluation segment and cannot leak the test outcome.
+
+    - ``method="multiplicative"`` scales by ``mean(actual) / mean(forecast)``,
+      centering the average level.
+    - ``method="variance_rms"`` scales by ``sqrt(mean((actual/forecast)^2))``,
+      which centers the volatility-targeting implied level: a target-tracking
+      position of ``target/forecast`` then realizes roughly ``target``.
+    - ``method="loglinear"`` fits ``log(actual) = a + b*log(forecast)`` and can
+      restore variance (``b > 1``) as well as the level.
+
+    Assets with too few source rows get a NaN calibrated column.
+    """
+    if method not in ("multiplicative", "variance_rms", "loglinear"):
+        raise ValueError(f"unknown calibration method: {method}")
+    if min_observations <= 0:
+        raise ValueError("min_observations must be positive")
+    data = frame.copy()
+    data[output_column] = np.nan
+    for asset, group in data.groupby("asset", sort=True):
+        source = group.loc[
+            (group["segment"] == source_segment)
+            & group[[forecast_column, actual_column]].notna().all(axis=1)
+        ]
+        if len(source) < min_observations:
+            continue
+        forecast = source[forecast_column].to_numpy(dtype=float)
+        actual = source[actual_column].to_numpy(dtype=float)
+        valid = np.isfinite(forecast) & np.isfinite(actual) & (actual > 0)
+        forecast, actual = forecast[valid], actual[valid]
+        if forecast.size == 0:
+            continue
+        if method == "multiplicative":
+            scale = float(actual.mean() / forecast.mean())
+            data.loc[group.index, output_column] = data.loc[group.index, forecast_column].to_numpy(dtype=float) * scale
+        elif method == "variance_rms":
+            scale = float(np.sqrt(np.mean(np.square(actual / forecast))))
+            data.loc[group.index, output_column] = data.loc[group.index, forecast_column].to_numpy(dtype=float) * scale
+        else:  # loglinear
+            slope, intercept = np.polyfit(np.log(forecast), np.log(actual), 1)
+            data.loc[group.index, output_column] = (
+                np.exp(intercept) * np.power(data.loc[group.index, forecast_column].to_numpy(dtype=float), slope)
+            )
+    return data
+
+
 def transmission_waterfall(
     frame: pd.DataFrame,
     *,

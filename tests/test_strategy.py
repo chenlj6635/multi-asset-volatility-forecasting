@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from src.strategy import (
+    calibrate_forecast_level,
     inverse_vol_weights,
     portfolio_metrics,
     transmission_waterfall,
@@ -103,5 +104,34 @@ def test_portfolio_schemes_and_inverse_weights() -> None:
     for metric in (equal, inverse_hist, inverse_fc):
         assert metric["n_days"] > 0
         assert np.isfinite(metric["realized_vol"])
+
+
+def test_level_calibration_recovers_forecast_scale() -> None:
+    rng = np.random.default_rng(1)
+    dates = pd.date_range("2020-01-01", periods=60, freq="B")
+    rows = []
+    for asset, base in (("A", 0.15), ("B", 0.25)):
+        actual = np.maximum(base + rng.normal(0, 0.02, len(dates)), 0.05)
+        for index, date in enumerate(dates):
+            segment = "train" if index < 40 else ("validation" if index < 50 else "test")
+            rows.append({
+                "asset": asset, "date": date, "segment": segment,
+                "future_rv_5d": actual[index], "biased_rv": actual[index] * 0.8,
+            })
+    frame = pd.DataFrame(rows)
+    expected_scale = 1 / 0.8
+    for method in ("multiplicative", "variance_rms"):
+        out = calibrate_forecast_level(frame, forecast_column="biased_rv", output_column="cal_rv", source_segment="validation", method=method, min_observations=5)
+        scale = float(out.loc[out["asset"] == "A", "cal_rv"].iloc[0] / frame.loc[frame["asset"] == "A", "biased_rv"].iloc[0])
+        np.testing.assert_allclose(scale, expected_scale, rtol=1e-6)
+        np.testing.assert_allclose(out["cal_rv"], frame["future_rv_5d"], rtol=1e-6)
+    out = calibrate_forecast_level(frame, forecast_column="biased_rv", output_column="cal_rv", source_segment="validation", method="loglinear", min_observations=5)
+    np.testing.assert_allclose(out["cal_rv"], frame["future_rv_5d"], rtol=1e-6)
+
+
+def test_level_calibration_rejects_unknown_method() -> None:
+    frame = _strategy_frame()
+    with pytest.raises(ValueError, match="unknown calibration method"):
+        calibrate_forecast_level(frame, forecast_column="ewma_rv", output_column="cal_rv", method="bogus")
     with pytest.raises(ValueError, match="weight_scheme"):
         portfolio_metrics(frame, weight_scheme="mean_variance")

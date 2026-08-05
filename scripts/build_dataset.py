@@ -47,7 +47,7 @@ from src.labels import add_future_realized_volatility, add_log_returns, add_rang
 from src.metrics import evaluate_forecast, metrics_by_asset
 from src.models import fit_garch_by_asset, fit_lightgbm_by_asset, fit_ridge_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_metrics, write_quality_report, write_results
-from src.strategy import portfolio_metrics, transmission_waterfall, vol_targeting_metrics
+from src.strategy import calibrate_forecast_level, portfolio_metrics, transmission_waterfall, vol_targeting_metrics
 
 # All prediction columns including the experimental HAR-VIX variant.
 ALL_FORECAST_COLUMNS = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv", "har_vix_rv")
@@ -353,6 +353,20 @@ def build(
         expanding_params = pd.DataFrame()
         expanding_comparison = pd.DataFrame()
         expanding_dm = pd.DataFrame()
+    calib_config = config.get("calibration", {}) or {}
+    if calib_config.get("enabled", True):
+        calib_method = str(calib_config.get("method", "variance_rms"))
+        calib_source = str(calib_config.get("source_segment", "validation"))
+        for calib_model in [str(value) for value in calib_config.get("models", ["lgb_rv"])]:
+            calib_column = f"{calib_model}_cal"
+            segmented = calibrate_forecast_level(
+                segmented,
+                forecast_column=calib_model,
+                output_column=calib_column,
+                source_segment=calib_source,
+                method=calib_method,
+            )
+            predictions[calib_column] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)[calib_column].to_numpy()
     metrics = metrics_by_asset(
         predictions,
         forecast_columns=ALL_FORECAST_COLUMNS,
@@ -622,6 +636,13 @@ def build(
             "first_eval_year_equals_locked": True,
             "comparison_output": outputs.get("expanding_comparison"),
             "dm_output": outputs.get("expanding_dm"),
+        },
+        "calibration": {
+            "enabled": bool(calib_config.get("enabled", True)),
+            "method": calib_method,
+            "source_segment": calib_source,
+            "models": [f"{model}_cal" for model in calib_config.get("models", ["lgb_rv"])] if calib_config.get("enabled", True) else [],
+            "leakage_rule": "scale estimated on source segment only, applied to all rows",
         },
         "regime_robustness": {
             "definition": "test future_rv_5d pooled tertiles",
