@@ -80,6 +80,16 @@ def make_config(tmp_path: Path) -> Path:
                 "lambda_grid": [0.0, 0.1, 1.0, 10.0],
                 "lasso_lambda_grid": [0.0, 0.001, 0.01],
             },
+            "lightgbm": {
+                "enabled": True,
+                "num_leaves": [4, 8],
+                "learning_rate": [0.05, 0.1],
+                "n_estimators": [5, 10],
+                "min_child_samples": 3,
+                "min_train_observations": 10,
+                "min_validation_observations": 3,
+                "worst_error_top_n": 5,
+            },
         },
         "outputs": {
             "predictions": str(tmp_path / "processed/predictions.parquet"),
@@ -92,6 +102,9 @@ def make_config(tmp_path: Path) -> Path:
             "garch_params": str(tmp_path / "outputs/garch_params.csv"),
             "ridge_params": str(tmp_path / "outputs/ridge_params.csv"),
             "ridge_lambda_selection": str(tmp_path / "outputs/ridge_lambda_selection.csv"),
+            "lightgbm_params": str(tmp_path / "outputs/lightgbm_params.csv"),
+            "lightgbm_importance": str(tmp_path / "outputs/lightgbm_importance.csv"),
+            "worst_error_dates": str(tmp_path / "outputs/worst_error_dates.csv"),
             "test_model_comparison": str(tmp_path / "outputs/test_model_comparison.csv"),
             "vix_incremental_comparison": str(tmp_path / "outputs/vix_incremental_comparison.csv"),
             "asset_robustness": str(tmp_path / "outputs/asset_robustness.csv"),
@@ -130,6 +143,9 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
         tmp_path / "outputs/garch_params.csv",
         tmp_path / "outputs/ridge_params.csv",
         tmp_path / "outputs/ridge_lambda_selection.csv",
+        tmp_path / "outputs/lightgbm_params.csv",
+        tmp_path / "outputs/lightgbm_importance.csv",
+        tmp_path / "outputs/worst_error_dates.csv",
         tmp_path / "outputs/test_model_comparison.csv",
         tmp_path / "outputs/vix_incremental_comparison.csv",
         tmp_path / "outputs/asset_robustness.csv",
@@ -145,62 +161,80 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
         tmp_path / "outputs/yearly_metrics.csv",
     ]
     assert all(path.exists() and path.stat().st_size > 0 for path in expected)
-    predictions = pd.read_parquet(expected[2])
+    out = tmp_path / "outputs"
+    predictions = pd.read_parquet(tmp_path / "processed/predictions.parquet")
     assert set(predictions.asset) == set(ASSETS[:-1])
-    assert {"historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"}.issubset(predictions.columns)
+    assert {"historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv", "har_vix_rv"}.issubset(predictions.columns)
     assert predictions.groupby("asset")["future_rv_5d"].tail(5).isna().all()
-    metrics = pd.read_csv(expected[3])
-    assert metrics.asset.tolist() == ["GLD", "IWM", "QQQ", "SPY", "TLT", "USO", "ALL"] * 6
-    assert set(metrics.forecast) == {"historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"}
+    metrics = pd.read_csv(out / "metrics.csv")
+    assert metrics.asset.tolist() == ["GLD", "IWM", "QQQ", "SPY", "TLT", "USO", "ALL"] * 7
+    assert set(metrics.forecast) == {"historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv", "har_vix_rv"}
     assert np.isfinite(metrics[["mae", "rmse", "qlike"]].to_numpy()).all()
-    walk_metrics = pd.read_csv(expected[4])
+    walk_metrics = pd.read_csv(out / "walk_forward_metrics.csv")
     assert set(walk_metrics.segment) == {"train", "validation", "test"}
-    assert set(walk_metrics.forecast) == {"historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"}
-    dm = pd.read_csv(expected[5])
+    assert set(walk_metrics.forecast) == {"historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv", "har_vix_rv"}
+    dm = pd.read_csv(out / "dm_tests.csv")
     assert set(dm.segment) == {"train", "validation", "test"}
     assert set(dm.asset) == set(ASSETS[:-1]) | {"ALL"}
     assert {"n_dates", "paired_rows"}.issubset(dm.columns)
     assert set(dm.loss) == {"qlike", "mae"}
-    assert len(dm) == 240
-    selection = pd.read_csv(expected[6])
+    assert len(dm) == 330
+    assert {"lgb_rv"}.issubset(set(dm.loc[dm["loss"] == "qlike", "model_a"]))
+    selection = pd.read_csv(out / "ewma_lambda_selection.csv")
     assert len(selection) == 4
     assert selection.selected.sum() == 1
     assert selection.selection_segment.iloc[0] == "validation"
-    coefficients = pd.read_csv(expected[7])
-    vix_coefficients = pd.read_csv(expected[8])
+    coefficients = pd.read_csv(out / "har_coefficients.csv")
+    vix_coefficients = pd.read_csv(out / "har_vix_coefficients.csv")
     assert set(vix_coefficients.asset) == set(ASSETS[:-1])
-    garch_params = pd.read_csv(expected[9])
+    garch_params = pd.read_csv(out / "garch_params.csv")
     assert set(garch_params.asset) == set(ASSETS[:-1])
-    ridge_params = pd.read_csv(expected[10])
-    ridge_selection = pd.read_csv(expected[11])
+    ridge_params = pd.read_csv(out / "ridge_params.csv")
+    ridge_selection = pd.read_csv(out / "ridge_lambda_selection.csv")
     assert set(ridge_params.asset) == set(ASSETS[:-1])
     assert set(ridge_selection["penalty"]) == {"ridge"}
-    comparison = pd.read_csv(expected[12])
-    vix_incremental = pd.read_csv(expected[13])
+    lightgbm_params = pd.read_csv(out / "lightgbm_params.csv")
+    assert set(lightgbm_params.asset) == set(ASSETS[:-1])
+    assert (lightgbm_params["status"] == "ok").all()
+    assert lightgbm_params["selected_num_leaves"].notna().all()
+    importance = pd.read_csv(out / "lightgbm_importance.csv")
+    assert {"asset", "feature", "importance_gain", "importance_gain_share"}.issubset(importance.columns)
+    assert set(importance["asset"]) == set(ASSETS[:-1])
+    assert (importance["importance_gain"] >= 0).all()
+    worst_errors = pd.read_csv(out / "worst_error_dates.csv")
+    assert {"asset", "date", "lgb_rv", "garch_rv", "abs_err_lgb_rv"}.issubset(worst_errors.columns)
+    comparison = pd.read_csv(out / "test_model_comparison.csv")
+    assert {"lgb_rv"}.issubset(set(comparison["forecast"]))
+    vix_incremental = pd.read_csv(out / "vix_incremental_comparison.csv")
     assert set(vix_incremental["model_a"]) == {"har_vix_rv"}
     assert set(vix_incremental["model_b"]) == {"har_rv"}
-    saved_metadata = json.loads(expected[16].read_text())
+    saved_metadata = json.loads((out / "metadata.json").read_text())
     assert saved_metadata["qlike_scale"] == "variance"
     assert saved_metadata["dm_test"]["primary_loss"] == "qlike"
     assert saved_metadata["dm_test"]["losses"] == ["qlike", "mae"]
     assert saved_metadata["ewma"]["test_evaluation_locked"] is True
     assert saved_metadata["walk_forward"]["forecast_state"] == "computed continuously across segment boundaries"
-    strategy_metrics = pd.read_csv(expected[-7])
+    assert saved_metadata["lightgbm"]["forecast_column"] == "lgb_rv"
+    assert saved_metadata["lightgbm"]["parameters_locked"] is True
+    strategy_metrics = pd.read_csv(out / "strategy_metrics.csv")
     assert {"historical_rv_21d", "fixed_100pct"}.issubset(set(strategy_metrics["forecast"]))
-    transmission = pd.read_csv(expected[-6])
+    assert "lgb_rv" in set(strategy_metrics["forecast"])
+    transmission = pd.read_csv(out / "transmission_waterfall.csv")
     assert set(transmission["stage"]) == {
         "no cap / no lag / no cost", "leverage cap", "+ one-day lag", "+ transaction cost",
     }
-    portfolio = pd.read_csv(expected[-5])
+    portfolio = pd.read_csv(out / "portfolio_metrics.csv")
     assert set(portfolio["scheme"]) == {"equal", "inverse_historical", "inverse_forecast"}
-    alt_label_metrics = pd.read_csv(expected[-4])
+    alt_label_metrics = pd.read_csv(out / "alt_label_metrics.csv")
     assert set(alt_label_metrics["label"]) == {"future_rv_parkinson_5d", "future_rv_garman_klass_5d"}
-    alt_label_dm = pd.read_csv(expected[-3])
-    assert {"garch_rv", "ridge_rv"}.issubset(set(alt_label_dm["model_a"]))
-    cost_sensitivity = pd.read_csv(expected[-2])
+    assert "lgb_rv" in set(alt_label_metrics["forecast"])
+    alt_label_dm = pd.read_csv(out / "alt_label_dm.csv")
+    assert {"garch_rv", "ridge_rv", "lgb_rv"}.issubset(set(alt_label_dm["model_a"]))
+    cost_sensitivity = pd.read_csv(out / "strategy_cost_sensitivity.csv")
     assert set(cost_sensitivity["cost_bps"]) == {10.0, 20.0}
-    yearly_metrics = pd.read_csv(expected[-1])
+    yearly_metrics = pd.read_csv(out / "yearly_metrics.csv")
     assert {"year", "segment", "forecast", "qlike_vs_historical"}.issubset(yearly_metrics.columns)
+    assert "lgb_rv" in set(yearly_metrics["forecast"])
     assert saved_metadata["strategy"]["evaluation_segment"] == "test"
 
 

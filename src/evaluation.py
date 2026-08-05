@@ -229,15 +229,65 @@ def dm_by_segment(
     return pd.DataFrame(rows)[["segment", "asset", "loss", "model_a", "model_b", "n_obs", "n_dates", "paired_rows", "mean_loss_diff", "hac_lag", "long_run_variance", "hac_standard_error", "dm_statistic", "p_value"]]
 
 
-def test_model_comparison(frame: pd.DataFrame, *, segment: str = "test", asset: str | None = None) -> pd.DataFrame:
+def test_model_comparison(
+    frame: pd.DataFrame,
+    *,
+    segment: str = "test",
+    asset: str | None = None,
+    forecast_columns: tuple[str, ...] = (
+        "historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv",
+    ),
+) -> pd.DataFrame:
     """Return test-segment model metrics with per-metric ranks."""
     data = frame.loc[frame["segment"] == segment]
-    metrics = walk_forward_metrics(data, forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"))
+    metrics = walk_forward_metrics(data, forecast_columns=forecast_columns)
     metrics = metrics.loc[(metrics["segment"] == segment) & (metrics["asset"] == (asset or "ALL"))].copy()
     for metric in ("mae", "rmse"):
         metrics[f"{metric}_rank"] = metrics[metric].rank(method="min", ascending=True).astype("Int64")
     metrics["qlike_rank"] = metrics["qlike"].rank(method="min", ascending=True).astype("Int64")
     return metrics
+
+
+def worst_error_summary(
+    frame: pd.DataFrame,
+    *,
+    segment: str = "test",
+    actual_column: str = "future_rv_5d",
+    forecast_columns: tuple[str, ...] = ("lgb_rv", "garch_rv", "har_rv", "ridge_rv"),
+    top_n: int = 15,
+) -> pd.DataFrame:
+    """Return the worst per-asset forecast dates in a segment with model errors.
+
+    For each asset the ``top_n`` test rows with the largest absolute error of the
+    first ``forecast_columns`` entry (the focus model) are reported together with
+    the other models' predictions and absolute errors, so the dates where the
+    focus model fails hardest can be inspected against competing models.
+    """
+    if top_n <= 0:
+        raise ValueError("top_n must be positive")
+    focus_column = forecast_columns[0]
+    data = frame.loc[frame["segment"] == segment].copy()
+    rows: list[dict[str, float | int | str]] = []
+    for asset, group in data.groupby("asset", sort=True):
+        valid = group.loc[group[actual_column].notna() & group[focus_column].notna()].copy()
+        valid["_abs_err_focus"] = (valid[focus_column] - valid[actual_column]).abs()
+        top = valid.sort_values("_abs_err_focus", ascending=False).head(top_n)
+        for _, row in top.iterrows():
+            entry: dict[str, float | int | str] = {
+                "asset": asset, "date": row["date"],
+                actual_column: row[actual_column],
+            }
+            for column in forecast_columns:
+                entry[column] = row[column]
+                entry[f"abs_err_{column}"] = abs(float(row[column]) - float(row[actual_column]))
+            rows.append(entry)
+    columns = ["asset", "date", actual_column]
+    for column in forecast_columns:
+        columns.append(column)
+        columns.append(f"abs_err_{column}")
+    return pd.DataFrame(rows, columns=columns)
+
+
 def assign_test_volatility_regimes(frame: pd.DataFrame, *, actual_column: str = "future_rv_5d") -> tuple[pd.DataFrame, dict[str, float]]:
     """Assign low/medium/high regimes from pooled test realized volatility tertiles."""
     data = frame.copy(); data["regime"] = pd.NA
@@ -251,7 +301,7 @@ def assign_test_volatility_regimes(frame: pd.DataFrame, *, actual_column: str = 
     return data, {"low_threshold": low, "high_threshold": high}
 
 
-def regime_robustness_summary(frame: pd.DataFrame, *, models: tuple[str, ...] = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv")) -> pd.DataFrame:
+def regime_robustness_summary(frame: pd.DataFrame, *, models: tuple[str, ...] = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv")) -> pd.DataFrame:
     """Evaluate formal models by test volatility regime, asset, and pooled ALL."""
     rows = []
     for regime in ("low", "medium", "high"):
@@ -266,7 +316,7 @@ def regime_robustness_summary(frame: pd.DataFrame, *, models: tuple[str, ...] = 
     return result[["regime", "asset", "forecast", "n_obs", "mae", "rmse", "qlike", "variance_floor_count", "mae_rank", "rmse_rank", "qlike_rank"]]
 
 
-def asset_robustness_summary(frame: pd.DataFrame, *, segment: str = "test", models: tuple[str, ...] = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv")) -> pd.DataFrame:
+def asset_robustness_summary(frame: pd.DataFrame, *, segment: str = "test", models: tuple[str, ...] = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv")) -> pd.DataFrame:
     metrics = walk_forward_metrics(frame, forecast_columns=models)
     metrics = metrics.loc[(metrics["segment"] == segment) & (metrics["asset"] != "ALL")].copy()
     for metric in ("mae", "rmse", "qlike"):

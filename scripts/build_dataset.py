@@ -31,6 +31,7 @@ from src.evaluation import (
     asset_robustness_summary,
     test_model_comparison,
     walk_forward_metrics,
+    worst_error_summary,
 )
 from src.features import (
     add_ewma_volatility_candidates,
@@ -43,9 +44,14 @@ from src.features import (
 )
 from src.labels import add_future_realized_volatility, add_log_returns, add_range_based_future_volatility
 from src.metrics import evaluate_forecast, metrics_by_asset
-from src.models import fit_garch_by_asset, fit_ridge_by_asset
+from src.models import fit_garch_by_asset, fit_lightgbm_by_asset, fit_ridge_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_metrics, write_quality_report, write_results
 from src.strategy import portfolio_metrics, transmission_waterfall, vol_targeting_metrics
+
+# All prediction columns including the experimental HAR-VIX variant.
+ALL_FORECAST_COLUMNS = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv", "har_vix_rv")
+# Formal models used in comparisons, yearly metrics, and alternative labels.
+FORMAL_FORECAST_COLUMNS = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -214,18 +220,37 @@ def build(
         min_validation_observations=int(ridge_config.get("min_validation_observations", 20)),
     )
     predictions["ridge_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["ridge_rv"].to_numpy()
+    lightgbm_config = calculation.get("lightgbm", {}) or {}
+    lgb_feature_columns = [str(value) for value in lightgbm_config.get("feature_columns", [])] or ridge_feature_columns
+    segmented, lightgbm_params, lightgbm_selection, lightgbm_importance = fit_lightgbm_by_asset(
+        segmented,
+        feature_columns=lgb_feature_columns,
+        num_leaves_grid=tuple(int(value) for value in lightgbm_config.get("num_leaves", [8, 31])),
+        learning_rate_grid=tuple(float(value) for value in lightgbm_config.get("learning_rate", [0.05, 0.1])),
+        n_estimators_grid=tuple(int(value) for value in lightgbm_config.get("n_estimators", [100, 300])),
+        min_child_samples=int(lightgbm_config.get("min_child_samples", 20)),
+        subsample=float(lightgbm_config.get("subsample", 0.8)),
+        colsample_bytree=float(lightgbm_config.get("colsample_bytree", 0.8)),
+        reg_lambda=float(lightgbm_config.get("reg_lambda", 1.0)),
+        random_state=int(lightgbm_config.get("random_state", 42)),
+        variance_floor=float(calculation["forecast_variance_floor"]),
+        epsilon=float(calculation["qlike_epsilon"]),
+        min_train_observations=int(lightgbm_config.get("min_train_observations", 120)),
+        min_validation_observations=int(lightgbm_config.get("min_validation_observations", 20)),
+    )
+    predictions["lgb_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["lgb_rv"].to_numpy()
     metrics = metrics_by_asset(
         predictions,
-        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"),
+        forecast_columns=ALL_FORECAST_COLUMNS,
         epsilon=float(calculation["qlike_epsilon"]),
     )
     walk_metrics = walk_forward_metrics(
         segmented,
-        forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"),
+        forecast_columns=ALL_FORECAST_COLUMNS,
         epsilon=float(calculation["qlike_epsilon"]),
     )
     yearly_rows: list[dict[str, float | int | str]] = []
-    yearly_forecasts = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv")
+    yearly_forecasts = FORMAL_FORECAST_COLUMNS
     yearly_frame = segmented.assign(year=segmented["date"].dt.year)
     for (year, segment), group in yearly_frame.groupby(["year", "segment"]):
         baseline_qlike = evaluate_forecast(
@@ -262,6 +287,9 @@ def build(
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="ridge_rv", model_b_column="historical_rv_21d"),
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="ridge_rv", model_b_column="har_rv"),
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="ridge_rv", model_b_column="garch_rv"),
+        dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="lgb_rv", model_b_column="historical_rv_21d"),
+        dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="lgb_rv", model_b_column="har_rv"),
+        dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="lgb_rv", model_b_column="garch_rv"),
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="har_vix_rv", model_b_column="har_rv"),
     ], ignore_index=True) if bool(dm_config.get("enabled", True)) else pd.DataFrame()
     vix_incremental = dm_results.loc[(dm_results["model_a"] == "har_vix_rv") & (dm_results["model_b"] == "har_rv")].copy()
@@ -273,7 +301,7 @@ def build(
     strategy_cost_bps = float(strategy_config.get("cost_bps", 10.0))
     strategy_rebalance_every = int(strategy_config.get("rebalance_every", 5))
     strategy_forecasters = [str(value) for value in strategy_config.get(
-        "forecasting_models", ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"]
+        "forecasting_models", ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv"]
     )]
     strategy_parts = []
     for forecast in strategy_forecasters:
@@ -326,13 +354,13 @@ def build(
     for label in alt_label_columns:
         label_metrics = walk_forward_metrics(
             segmented,
-            forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"),
+            forecast_columns=FORMAL_FORECAST_COLUMNS,
             actual_column=label,
             epsilon=float(calculation["qlike_epsilon"]),
         )
         label_metrics["label"] = label
         alt_label_metrics_parts.append(label_metrics)
-        for model_a in ("garch_rv", "ridge_rv"):
+        for model_a in ("garch_rv", "ridge_rv", "lgb_rv"):
             dm_part = dm_by_segment(
                 segmented,
                 max_lag=int(dm_config["hac_lag"]),
@@ -370,6 +398,12 @@ def build(
                 "total_cost": pooled["total_cost"],
             })
     cost_sensitivity = pd.DataFrame(cost_rows)
+    worst_errors = worst_error_summary(
+        segmented,
+        segment=strategy_segment,
+        forecast_columns=("lgb_rv", "garch_rv", "har_rv", "ridge_rv"),
+        top_n=int(lightgbm_config.get("worst_error_top_n", 15)),
+    )
     raw_files = {
         asset: {
             "path": str(raw_dir / filename),
@@ -441,10 +475,33 @@ def build(
             "parameter_assets": int(len(ridge_params)),
             "forecast_column": "ridge_rv",
         },
+        "lightgbm": {
+            "enabled": bool(lightgbm_config.get("enabled", True)),
+            "boosting": "gbdt",
+            "target": "log variance of future_rv_5d (exponential recovery + smearing)",
+            "feature_columns": lgb_feature_columns,
+            "n_features": len(lgb_feature_columns),
+            "hyperparameter_selection": "per asset, validation pooled QLIKE over num_leaves x learning_rate x n_estimators",
+            "grid": {
+                "num_leaves": [int(value) for value in lightgbm_config.get("num_leaves", [8, 31])],
+                "learning_rate": [float(value) for value in lightgbm_config.get("learning_rate", [0.05, 0.1])],
+                "n_estimators": [int(value) for value in lightgbm_config.get("n_estimators", [100, 300])],
+            },
+            "min_child_samples": int(lightgbm_config.get("min_child_samples", 20)),
+            "random_state": int(lightgbm_config.get("random_state", 42)),
+            "deterministic": True,
+            "variance_floor": float(calculation["forecast_variance_floor"]),
+            "parameters_locked": True,
+            "parameter_output": outputs["lightgbm_params"],
+            "importance_output": outputs["lightgbm_importance"],
+            "worst_error_output": outputs["worst_error_dates"],
+            "parameter_assets": int(len(lightgbm_params)),
+            "forecast_column": "lgb_rv",
+        },
         "regime_robustness": {
             "definition": "test future_rv_5d pooled tertiles",
             "thresholds": regime_thresholds,
-            "models": ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"],
+            "models": list(FORMAL_FORECAST_COLUMNS),
             "output": outputs["regime_robustness"],
         },
         "vix_incremental": {
@@ -471,14 +528,14 @@ def build(
             "coefficient_assets": int(len(har_vix_coefficients)),
             "forecast_column": "har_vix_rv",
         },
-        "forecast_columns": ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"],
+        "forecast_columns": list(ALL_FORECAST_COLUMNS),
         "qlike_scale": "variance",
         "raw_files": raw_files,
         "quality_status": quality_summary["status"],
         "prediction_rows": int(len(predictions)),
         "valid_evaluation_rows": {
             column: int(predictions[["future_rv_5d", column]].notna().all(axis=1).sum())
-            for column in ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"]
+            for column in ALL_FORECAST_COLUMNS
         },
         "ewma_lambda_selection": lambda_selection.to_dict(orient="records"),
         "dm_test": {
@@ -493,6 +550,9 @@ def build(
                 {"model_a": "ridge_rv", "model_b": "historical_rv_21d"},
                 {"model_a": "ridge_rv", "model_b": "har_rv"},
                 {"model_a": "ridge_rv", "model_b": "garch_rv"},
+                {"model_a": "lgb_rv", "model_b": "historical_rv_21d"},
+                {"model_a": "lgb_rv", "model_b": "har_rv"},
+                {"model_a": "lgb_rv", "model_b": "garch_rv"},
                 {"model_a": "har_vix_rv", "model_b": "har_rv"},
             ],
             "pooled_rule": "cross-sectional mean by date before HAC",
@@ -547,7 +607,7 @@ def build(
                         & (walk_metrics["asset"] == "ALL"),
                         "n_obs",
                     ].iloc[0])
-                    for forecast in ["historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv"]
+                    for forecast in FORMAL_FORECAST_COLUMNS
                 }
                 for segment in ["train", "validation", "test"]
             },
@@ -568,6 +628,9 @@ def build(
     write_metrics(garch_params, resolve(root, outputs["garch_params"]))
     write_metrics(ridge_params, resolve(root, outputs["ridge_params"]))
     write_metrics(ridge_selection, resolve(root, outputs["ridge_lambda_selection"]))
+    write_metrics(lightgbm_params, resolve(root, outputs["lightgbm_params"]))
+    write_metrics(lightgbm_importance, resolve(root, outputs["lightgbm_importance"]))
+    write_metrics(worst_errors, resolve(root, outputs["worst_error_dates"]))
     write_metrics(comparison, resolve(root, outputs["test_model_comparison"]))
     write_metrics(robustness, resolve(root, outputs["asset_robustness"]))
     write_metrics(regime_robustness, resolve(root, outputs["regime_robustness"]))

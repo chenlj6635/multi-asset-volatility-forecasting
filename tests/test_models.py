@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.models import _fit_ridge_ls, fit_garch_by_asset, fit_ridge_by_asset
+from src.models import _fit_ridge_ls, fit_garch_by_asset, fit_lightgbm_by_asset, fit_ridge_by_asset
 
 
 def _garch_frame(seed: int = 0) -> pd.DataFrame:
@@ -131,3 +131,52 @@ def test_ridge_insufficient_data_is_reported() -> None:
     assert (params["status"] == "insufficient_observations").all()
     assert result["ridge_rv"].isna().all()
     assert selection.empty
+
+
+def test_lightgbm_selects_hyperparameters_on_validation_and_forecasts_positive() -> None:
+    frame = _ridge_frame()
+    result, params, selection, importance = fit_lightgbm_by_asset(
+        frame, feature_columns=RIDGE_FEATURES,
+        num_leaves_grid=(4, 8), learning_rate_grid=(0.05, 0.1), n_estimators_grid=(5, 10),
+        min_child_samples=5, min_train_observations=100, min_validation_observations=20,
+    )
+    assert set(params["asset"]) == {"A", "B"}
+    assert (params["status"] == "ok").all()
+    assert params["selected_num_leaves"].notna().all()
+    assert params["selected_learning_rate"].notna().all()
+    assert params["selected_n_estimators"].notna().all()
+    assert len(selection) == 2 * 2 * 2 * 2
+    for asset in ("A", "B"):
+        assert selection.loc[selection["asset"] == asset, "selected"].sum() == 1
+    assert result["lgb_rv"].notna().all()
+    assert (result["lgb_rv"] > 0).all()
+    test_means = result.loc[result["segment"] == "test"].groupby("asset")["lgb_rv"].mean()
+    assert test_means["B"] > test_means["A"]
+
+
+def test_lightgbm_importance_reported() -> None:
+    frame = _ridge_frame()
+    _, _, _, importance = fit_lightgbm_by_asset(
+        frame, feature_columns=RIDGE_FEATURES,
+        num_leaves_grid=(4,), learning_rate_grid=(0.05,), n_estimators_grid=(5,),
+        min_child_samples=5, min_train_observations=100, min_validation_observations=20,
+    )
+    assert set(importance["asset"]) == {"A", "B"}
+    assert set(importance["feature"]) == set(RIDGE_FEATURES)
+    assert (importance["importance_gain"] >= 0).all()
+    assert (importance["importance_split"] >= 0).all()
+    per_asset_share = importance.groupby("asset")["importance_gain_share"].sum()
+    np.testing.assert_allclose(per_asset_share, 1.0, atol=1e-6)
+
+
+def test_lightgbm_insufficient_data_is_reported() -> None:
+    frame = _ridge_frame()
+    result, params, selection, importance = fit_lightgbm_by_asset(
+        frame, feature_columns=RIDGE_FEATURES,
+        num_leaves_grid=(4,), learning_rate_grid=(0.05,), n_estimators_grid=(5,),
+        min_train_observations=10_000, min_validation_observations=20,
+    )
+    assert (params["status"] == "insufficient_observations").all()
+    assert result["lgb_rv"].isna().all()
+    assert selection.empty
+    assert importance.empty

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import product
+
 import numpy as np
 import pandas as pd
 
@@ -366,3 +368,242 @@ def fit_ridge_by_asset(
         "n_train", "n_validation", "validation_qlike", "status", *feature_columns,
     ]
     return data, params[[column for column in column_order if column in params.columns]], selection
+
+
+def fit_lightgbm_by_asset(
+    frame: pd.DataFrame,
+    *,
+    feature_columns: list[str] | tuple[str, ...],
+    actual_column: str = "future_rv_5d",
+    output_column: str = "lgb_rv",
+    num_leaves_grid: tuple[int, ...] = (8, 31),
+    learning_rate_grid: tuple[float, ...] = (0.05, 0.1),
+    n_estimators_grid: tuple[int, ...] = (100, 300),
+    min_child_samples: int = 20,
+    subsample: float = 0.8,
+    colsample_bytree: float = 0.8,
+    reg_lambda: float = 1.0,
+    random_state: int = 42,
+    n_jobs: int = 1,
+    train_segment: str = "train",
+    validation_segment: str = "validation",
+    log_floor: float = 1.0e-12,
+    variance_floor: float = 1.0e-4,
+    epsilon: float = 1.0e-12,
+    min_train_observations: int = 120,
+    min_validation_observations: int = 20,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fit a LightGBM regressor per asset on log variance with locked hyperparameters.
+
+    The model regresses ``log(future_rv_5d^2)`` on the given features using only
+    train rows (all features and the target finite, the same row filter as
+    :func:`fit_ridge_by_asset`). The Cartesian grid over ``num_leaves``,
+    ``learning_rate``, and ``n_estimators`` is scored per asset on the validation
+    segment by pooled QLIKE (ties resolve to the first configuration), the best
+    configuration is refit on the train segment, and forecasts are recovered with
+    an exponential plus the lognormal smearing offset (``0.5 * residual variance``)
+    so they are always strictly positive and never need variance clipping.
+
+    Returns ``(data, params, selection, importance)``:
+    - ``params``: per-asset selected hyperparameters, validation QLIKE, status.
+    - ``selection``: per-asset per-configuration validation QLIKE and selected flag.
+    - ``importance``: per-asset gain and split feature importance from the refit
+      model, with the within-asset gain share.
+    Assets whose fit fails or that lack training or validation rows are reported in
+    ``params`` with a NaN forecast column, mirroring the GARCH and Ridge pattern.
+    """
+    if log_floor <= 0:
+        raise ValueError("log_floor must be positive")
+    if variance_floor <= 0:
+        raise ValueError("variance_floor must be positive")
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    if min_train_observations <= 0 or min_validation_observations <= 0:
+        raise ValueError("minimum observation counts must be positive")
+    feature_columns = list(feature_columns)
+    if not feature_columns:
+        raise ValueError("feature_columns must be non-empty")
+    num_leaves_values = [int(value) for value in num_leaves_grid]
+    learning_rate_values = [float(value) for value in learning_rate_grid]
+    estimator_values = [int(value) for value in n_estimators_grid]
+    if not (num_leaves_values and learning_rate_values and estimator_values):
+        raise ValueError("hyperparameter grids must be non-empty")
+
+    data = frame.sort_values(["asset", "date"], kind="stable").copy()
+    data[output_column] = np.nan
+    parameter_rows: list[dict[str, float | int | str]] = []
+    selection_rows: list[dict[str, float | int | str | bool]] = []
+    importance_rows: list[dict[str, float | int | str]] = []
+
+    for asset, group in data.groupby("asset", sort=True):
+        train = group.loc[
+            (group["segment"] == train_segment)
+            & group[[actual_column, *feature_columns]].notna().all(axis=1)
+        ]
+        validation = group.loc[
+            (group["segment"] == validation_segment)
+            & group[[actual_column, *feature_columns]].notna().all(axis=1)
+        ]
+        if len(train) < min_train_observations or len(validation) < min_validation_observations:
+            parameter_rows.append({
+                "asset": asset, "selected_num_leaves": np.nan,
+                "selected_learning_rate": np.nan, "selected_n_estimators": np.nan,
+                "n_train": int(len(train)), "n_validation": int(len(validation)),
+                "validation_qlike": np.nan, "smearing_offset": np.nan,
+                "status": "insufficient_observations",
+            })
+            continue
+
+        train_x = train[feature_columns].to_numpy(dtype=float)
+        train_y = np.log(np.maximum(np.square(train[actual_column].to_numpy(dtype=float)), log_floor))
+        validation_x = validation[feature_columns].to_numpy(dtype=float)
+        validation_actual_vol = validation[actual_column].to_numpy(dtype=float)
+
+        best_config: tuple[int, float, int] | None = None
+        best_qlike = np.inf
+        for num_leaves, learning_rate, estimators in product(
+            num_leaves_values, learning_rate_values, estimator_values
+        ):
+            try:
+                model = _fit_lgb_regressor(
+                    train_x,
+                    train_y,
+                    num_leaves=num_leaves,
+                    learning_rate=learning_rate,
+                    n_estimators=estimators,
+                    min_child_samples=min_child_samples,
+                    subsample=subsample,
+                    colsample_bytree=colsample_bytree,
+                    reg_lambda=reg_lambda,
+                    random_state=random_state,
+                    n_jobs=n_jobs,
+                )
+                fitted_train = model.predict(train_x)
+                smearing = 0.5 * float(np.mean(np.square(train_y - fitted_train)))
+                raw_validation = np.exp(model.predict(validation_x) + smearing)
+            except Exception as exc:  # pragma: no cover - native training can fail
+                selection_rows.append({
+                    "asset": asset, "num_leaves": num_leaves,
+                    "learning_rate": learning_rate, "n_estimators": estimators,
+                    "validation_qlike": np.nan, "n_validation": int(len(validation)),
+                    "status": f"fit_failed: {str(exc)[:120]}", "selected": False,
+                })
+                continue
+            forecast_vol = np.sqrt(np.maximum(raw_validation, variance_floor))
+            qlike = evaluate_forecast(validation_actual_vol, forecast_vol, epsilon=epsilon).qlike
+            selection_rows.append({
+                "asset": asset, "num_leaves": num_leaves,
+                "learning_rate": learning_rate, "n_estimators": estimators,
+                "validation_qlike": qlike, "n_validation": int(len(validation)),
+                "status": "ok", "selected": False,
+            })
+            if np.isfinite(qlike) and (best_config is None or qlike < best_qlike):
+                best_qlike = float(qlike)
+                best_config = (num_leaves, learning_rate, estimators)
+        if best_config is None:
+            parameter_rows.append({
+                "asset": asset, "selected_num_leaves": np.nan,
+                "selected_learning_rate": np.nan, "selected_n_estimators": np.nan,
+                "n_train": int(len(train)), "n_validation": int(len(validation)),
+                "validation_qlike": np.nan, "smearing_offset": np.nan,
+                "status": "no_valid_candidate",
+            })
+            continue
+        for row in selection_rows:
+            if (
+                row["asset"] == asset
+                and row["num_leaves"] == best_config[0]
+                and row["learning_rate"] == best_config[1]
+                and row["n_estimators"] == best_config[2]
+            ):
+                row["selected"] = True
+
+        num_leaves, learning_rate, estimators = best_config
+        model = _fit_lgb_regressor(
+            train_x,
+            train_y,
+            num_leaves=num_leaves,
+            learning_rate=learning_rate,
+            n_estimators=estimators,
+            min_child_samples=min_child_samples,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            reg_lambda=reg_lambda,
+            random_state=random_state,
+            n_jobs=n_jobs,
+        )
+        fitted_train = model.predict(train_x)
+        smearing_offset = 0.5 * float(np.mean(np.square(train_y - fitted_train)))
+        valid = group[feature_columns].notna().all(axis=1)
+        raw_all = np.exp(model.predict(group.loc[valid, feature_columns].to_numpy(dtype=float)) + smearing_offset)
+        data.loc[group.index[valid], output_column] = np.sqrt(np.maximum(raw_all, variance_floor))
+
+        gains = np.asarray(model.booster_.feature_importance(importance_type="gain"), dtype=float)
+        splits = np.asarray(model.booster_.feature_importance(importance_type="split"), dtype=int)
+        total_gain = float(gains.sum())
+        for index, name in enumerate(feature_columns):
+            share = float(gains[index] / total_gain) if total_gain > 0 else np.nan
+            importance_rows.append({
+                "asset": asset, "feature": name,
+                "importance_gain": float(gains[index]),
+                "importance_split": int(splits[index]),
+                "importance_gain_share": share,
+            })
+        parameter_rows.append({
+            "asset": asset,
+            "selected_num_leaves": int(num_leaves),
+            "selected_learning_rate": float(learning_rate),
+            "selected_n_estimators": int(estimators),
+            "n_train": int(len(train)),
+            "n_validation": int(len(validation)),
+            "validation_qlike": best_qlike,
+            "smearing_offset": smearing_offset,
+            "status": "ok",
+        })
+
+    selection = pd.DataFrame(selection_rows)
+    params = pd.DataFrame(parameter_rows)
+    importance = pd.DataFrame(importance_rows)
+    params_order = [
+        "asset", "selected_num_leaves", "selected_learning_rate",
+        "selected_n_estimators", "n_train", "n_validation",
+        "validation_qlike", "smearing_offset", "status",
+    ]
+    return data, params[params_order], selection, importance
+
+
+def _fit_lgb_regressor(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    *,
+    num_leaves: int,
+    learning_rate: float,
+    n_estimators: int,
+    min_child_samples: int,
+    subsample: float,
+    colsample_bytree: float,
+    reg_lambda: float,
+    random_state: int,
+    n_jobs: int,
+):
+    """Fit a deterministic LightGBM regressor on ``log(future_rv_5d^2)``."""
+    from lightgbm import LGBMRegressor
+
+    model = LGBMRegressor(
+        objective="regression",
+        num_leaves=num_leaves,
+        learning_rate=learning_rate,
+        n_estimators=n_estimators,
+        min_child_samples=min_child_samples,
+        subsample=subsample,
+        subsample_freq=1,
+        colsample_bytree=colsample_bytree,
+        reg_lambda=reg_lambda,
+        random_state=random_state,
+        n_jobs=n_jobs,
+        deterministic=True,
+        force_row_wise=True,
+        verbosity=-1,
+    )
+    model.fit(train_x, train_y)
+    return model
