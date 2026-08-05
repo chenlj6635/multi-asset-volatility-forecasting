@@ -62,13 +62,20 @@ tests/                     Synthetic, network-free tests
 
 ## Environment
 
-Python 3.10 or later is required. Install the declared dependencies in an environment of your choice:
+Python 3.10 or later is required. A project virtual environment is provided (`.venv`, Python 3.12, Windows-native layout). To create it from scratch and install the pinned dependencies:
 
 ```bash
-python -m pip install -r requirements.txt
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt
 ```
 
-The implementation was tested with the already-installed global Python packages; no project virtual environment or package installation is required merely to run the checked-in tests in the current development environment.
+The pins in `requirements.txt` are load-bearing: `lightgbm>=3.3,<4.0` (4.x crashes on Windows/Anaconda) and `scikit-learn>=1.0,<1.6` (lightgbm 3.3.x calls the `force_all_finite` keyword that sklearn 1.6+ removed). Run the checks with the venv interpreter:
+
+```bash
+.venv/Scripts/python.exe -m pytest -q
+```
+
+All tests use synthetic local data and require no network.
 
 ## Data acquisition (online, separate command)
 

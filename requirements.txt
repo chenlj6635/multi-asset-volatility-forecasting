@@ -6,4 +6,5 @@ PyYAML>=6.0
 yfinance>=0.2.40
 arch>=7.0
 lightgbm>=3.3,<4.0
+scikit-learn>=1.0,<1.6
 pytest>=7.4
