@@ -119,6 +119,8 @@ This writes:
 - `outputs/tables/lightgbm_params.csv`
 - `outputs/tables/lightgbm_importance.csv`
 - `outputs/tables/worst_error_dates.csv`
+- `outputs/tables/expanding_comparison.csv`
+- `outputs/tables/expanding_dm.csv`
 - `outputs/tables/test_model_comparison.csv`
 - `outputs/tables/vix_incremental_comparison.csv`
 - `outputs/tables/asset_robustness.csv`
@@ -137,6 +139,10 @@ The metadata records raw-file SHA-256 hashes, the strict label interval, varianc
 ## Walk-forward evaluation
 
 Forecast dates are split into three configured segments: train through `2021-12-31`, validation from `2022-01-01` through `2023-12-31`, and test from `2024-01-01` onward. The last five forecast dates per asset are removed from train and validation so their `t+1` through `t+5` label windows cannot cross a segment boundary. Historical rolling and EWMA states are computed continuously from prior observations and are not restarted at validation or test boundaries. Segment, asset, forecast, and pooled `ALL` metrics are written to `outputs/tables/walk_forward_metrics.csv`.
+
+## Expanding-window re-estimation
+
+The locked protocol fits every learnable model once on the train segment and keeps the parameters fixed. A second, more realistic protocol re-estimates them on an expanding window: for each evaluation year `Y` the model is refit on all rows through `Y-1` (training to `Y-3`, with `Y-2..Y-1` as the validation slice for hyperparameter selection) and only used to forecast year `Y`. There is no lookahead — every training and selection label lies inside the window — and the first evaluation year (2024) reproduces the locked model exactly as a consistency check. Expanding-window predictions are written as `*_exp` columns in the parquet and compared with the locked protocol in `outputs/tables/expanding_comparison.csv` (test metrics per model and protocol) and `outputs/tables/expanding_dm.csv` (DM tests: expanding vs historical, expanding pairwise, and locked-vs-expanding per model). Under refit the four learnable models' test QLIKE converge to within 0.003 (all pairwise DM p > 0.84); LightGBM improves significantly (locked-vs-exp DM -2.88, p 0.004) and Ridge's high-volatility RMSE drops from 0.1455 to 0.1258, while GARCH and HAR are essentially unchanged.
 
 ## Diebold-Mariano comparison
 
@@ -199,4 +205,4 @@ All tests use synthetic local data and require no network. They verify exact lab
 
 ## Limitations
 
-The future five-day RV label is a noisy proxy constructed from daily squared returns and overlaps across adjacent rows. Yahoo Finance can revise history and may impose throttling or availability limits. Adjusted close and raw OHLC are on different adjustment bases, so raw range estimators require additional care in later milestones. The project is descriptive rather than a fully walk-forward-trained model family (parameters are locked once, not re-estimated on a rolling window); it does not yet include non-overlapping-label inference, model ensembles, or a rolling/expanding retraining protocol.
+The future five-day RV label is a noisy proxy constructed from daily squared returns and overlaps across adjacent rows. Yahoo Finance can revise history and may impose throttling or availability limits. Adjusted close and raw OHLC are on different adjustment bases, so raw range estimators require additional care in later milestones. The project reports its main results under a locked-parameter protocol (models fit once on the train segment), with an annual expanding-window re-estimation protocol provided as a robustness layer; it does not yet include non-overlapping-label inference, model ensembles, quarterly/monthly refit granularity, or a rolling window that drops stale data.

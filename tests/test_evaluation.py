@@ -6,9 +6,11 @@ import pytest
 
 from src.evaluation import (
     assign_walk_forward_segments,
+    assign_expanding_segments,
     diebold_mariano_test,
     dm_by_segment,
     exclude_cross_segment_labels,
+    expanding_window_forecasts,
     forecast_losses,
     walk_forward_metrics,
 )
@@ -101,3 +103,54 @@ def test_walk_forward_metrics_have_each_segment_and_forecast() -> None:
     assert set(result["forecast"]) == {"historical_rv_21d", "ewma_rv"}
     assert set(result["asset"]) == {"A", "ALL"}
     assert len(result) == 12
+
+
+def _multi_year_frame(seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2010-01-01", periods=6 * 250, freq="B")
+    base = np.linspace(0.010, 0.030, len(dates))
+    frame = pd.DataFrame({"asset": "A", "date": dates})
+    frame["har_daily_rv"] = np.maximum((base + rng.normal(0, 0.002, len(dates))) ** 2, 1e-8)
+    frame["har_weekly_rv"] = np.maximum((base + rng.normal(0, 0.003, len(dates))) ** 2, 1e-8)
+    frame["har_monthly_rv"] = np.maximum((base + rng.normal(0, 0.004, len(dates))) ** 2, 1e-8)
+    frame["future_rv_5d"] = np.maximum(
+        np.sqrt(np.maximum(frame["har_daily_rv"], 1e-8)) * 1.1 + rng.normal(0, 0.005, len(dates)), 0.01
+    )
+    return frame
+
+
+def test_expanding_segments_are_non_overlapping() -> None:
+    frame = assign_expanding_segments(_multi_year_frame(), eval_year=2014, validation_years=2)
+    by_year = frame.groupby(frame["date"].dt.year)["segment"].agg(lambda values: set(values))
+    assert by_year[2011] == {"train"}
+    assert by_year[2012] == {"validation"}
+    assert by_year[2013] == {"validation"}
+    assert by_year[2014] == {"test"}
+
+
+def test_expanding_forecasts_first_eval_year_equals_locked() -> None:
+    from src.evaluation import fit_har_by_asset
+
+    frame = _multi_year_frame()
+    expanding, _ = expanding_window_forecasts(
+        frame,
+        fit_function=fit_har_by_asset,
+        output_column="har_rv_exp",
+        eval_years=(2014, 2015),
+        validation_years=2,
+        horizon=5,
+        fit_kwargs={"train_segment": "train", "actual_column": "future_rv_5d", "output_column": "har_rv_exp"},
+    )
+    assert expanding["har_rv_exp"].notna().sum() > 0
+    for year in (2014, 2015):
+        values = expanding.loc[expanding["date"].dt.year == year, "har_rv_exp"]
+        assert values.notna().all()
+        assert (values > 0).all()
+    assert expanding.loc[expanding["date"].dt.year.isin([2010, 2012]), "har_rv_exp"].isna().all()
+
+    locked = assign_walk_forward_segments(frame, train_end="2011-12-31", validation_end="2013-12-31")
+    locked, _ = exclude_cross_segment_labels(locked, horizon=5)
+    locked_fit, _ = fit_har_by_asset(locked, train_segment="train", actual_column="future_rv_5d", output_column="har_rv")
+    exp_2014 = expanding.loc[expanding["date"].dt.year == 2014].sort_values("date")["har_rv_exp"].to_numpy()
+    locked_2014 = locked_fit.loc[locked_fit["date"].dt.year == 2014].sort_values("date")["har_rv"].to_numpy()
+    np.testing.assert_allclose(exp_2014, locked_2014, atol=1e-12)

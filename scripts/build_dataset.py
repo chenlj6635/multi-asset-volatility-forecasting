@@ -24,6 +24,7 @@ from src.evaluation import (
     assign_walk_forward_segments,
     dm_by_segment,
     exclude_cross_segment_labels,
+    expanding_window_forecasts,
     select_ewma_lambda,
     fit_har_by_asset,
     assign_test_volatility_regimes,
@@ -171,6 +172,7 @@ def build(
         train_end=walk_config["train_end"],
         validation_end=walk_config["validation_end"],
     )
+    segmented_full = segmented.copy()
     segmented, excluded_rows = exclude_cross_segment_labels(
         segmented,
         horizon=int(calculation["label_horizon"]),
@@ -239,6 +241,118 @@ def build(
         min_validation_observations=int(lightgbm_config.get("min_validation_observations", 20)),
     )
     predictions["lgb_rv"] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)["lgb_rv"].to_numpy()
+    exp_config = config.get("expanding_window", {}) or {}
+    exp_validation_years = int(exp_config.get("validation_years", 2))
+    exp_models: list[str] = []
+    exp_eval_years: tuple[int, ...] = ()
+    if exp_config.get("enabled", True):
+        exp_models = [str(value) for value in exp_config.get("models", ["har_rv", "garch_rv", "ridge_rv", "lgb_rv"])]
+        exp_horizon = int(calculation["label_horizon"])
+        exp_eval_years = tuple(sorted(
+            int(year) for year in set(segmented["date"].dt.year)
+            if segmented.loc[segmented["date"].dt.year == year, "segment"].eq("test").any()
+        ))
+        exp_function_map = {
+            "har_rv": fit_har_by_asset,
+            "garch_rv": fit_garch_by_asset,
+            "ridge_rv": fit_ridge_by_asset,
+            "lgb_rv": fit_lightgbm_by_asset,
+        }
+        exp_fit_kwargs = {
+            "har_rv": {"train_segment": "train", "actual_column": "future_rv_5d"},
+            "garch_rv": {
+                "train_segment": "train", "horizon": exp_horizon,
+                "annualization_factor": float(calculation["annualization_factor"]),
+                "p": int(garch_config.get("p", 1)), "q": int(garch_config.get("q", 1)),
+                "min_train_observations": int(garch_config.get("min_train_observations", 120)),
+            },
+            "ridge_rv": {
+                "train_segment": "train", "validation_segment": "validation",
+                "feature_columns": ridge_feature_columns, "actual_column": "future_rv_5d",
+                "penalty": ridge_penalty, "lambda_grid": ridge_grid,
+                "variance_floor": float(calculation["forecast_variance_floor"]),
+                "epsilon": float(calculation["qlike_epsilon"]),
+                "min_train_observations": int(ridge_config.get("min_train_observations", 120)),
+                "min_validation_observations": int(ridge_config.get("min_validation_observations", 20)),
+            },
+            "lgb_rv": {
+                "train_segment": "train", "validation_segment": "validation",
+                "feature_columns": lgb_feature_columns, "actual_column": "future_rv_5d",
+                "num_leaves_grid": tuple(int(value) for value in lightgbm_config.get("num_leaves", [8, 31])),
+                "learning_rate_grid": tuple(float(value) for value in lightgbm_config.get("learning_rate", [0.05, 0.1])),
+                "n_estimators_grid": tuple(int(value) for value in lightgbm_config.get("n_estimators", [100, 300])),
+                "min_child_samples": int(lightgbm_config.get("min_child_samples", 20)),
+                "subsample": float(lightgbm_config.get("subsample", 0.8)),
+                "colsample_bytree": float(lightgbm_config.get("colsample_bytree", 0.8)),
+                "reg_lambda": float(lightgbm_config.get("reg_lambda", 1.0)),
+                "random_state": int(lightgbm_config.get("random_state", 42)),
+                "variance_floor": float(calculation["forecast_variance_floor"]),
+                "epsilon": float(calculation["qlike_epsilon"]),
+                "min_train_observations": int(lightgbm_config.get("min_train_observations", 120)),
+                "min_validation_observations": int(lightgbm_config.get("min_validation_observations", 20)),
+            },
+        }
+        exp_param_parts: list[pd.DataFrame] = []
+        for exp_model in exp_models:
+            if exp_model not in exp_function_map:
+                continue
+            segmented_full, exp_params = expanding_window_forecasts(
+                segmented_full,
+                fit_function=exp_function_map[exp_model],
+                output_column=f"{exp_model}_exp",
+                eval_years=exp_eval_years,
+                validation_years=exp_validation_years,
+                horizon=exp_horizon,
+                fit_kwargs={**exp_fit_kwargs[exp_model], "output_column": f"{exp_model}_exp"},
+            )
+            segmented[f"{exp_model}_exp"] = segmented_full[f"{exp_model}_exp"].reindex(segmented.index)
+            predictions[f"{exp_model}_exp"] = segmented_full.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)[f"{exp_model}_exp"].to_numpy()
+            if not exp_params.empty:
+                exp_param_parts.append(exp_params)
+        expanding_params = pd.concat(exp_param_parts, ignore_index=True) if exp_param_parts else pd.DataFrame()
+        exp_cols = tuple(f"{model}_exp" for model in exp_models)
+        locked_metrics = walk_forward_metrics(
+            segmented, forecast_columns=tuple(exp_models), epsilon=float(calculation["qlike_epsilon"]),
+        )
+        expanding_metrics = walk_forward_metrics(
+            segmented, forecast_columns=exp_cols, epsilon=float(calculation["qlike_epsilon"]),
+        )
+        comparison_part = pd.concat([locked_metrics, expanding_metrics], ignore_index=True)
+        comparison_part = comparison_part.loc[comparison_part["segment"] == "test"].copy()
+        comparison_part["protocol"] = np.where(
+            comparison_part["forecast"].str.endswith("_exp"), "expanding", "locked"
+        )
+        comparison_part["model"] = np.where(
+            comparison_part["protocol"] == "expanding",
+            comparison_part["forecast"].str[:-4],
+            comparison_part["forecast"],
+        )
+        expanding_comparison = comparison_part[
+            ["segment", "asset", "model", "protocol", "n_obs", "mae", "rmse", "qlike", "variance_floor_count"]
+        ]
+        dm_parts: list[pd.DataFrame] = []
+        expanding_dm_config = config.get("dm_test", {})
+        dm_args = {
+            "max_lag": int(expanding_dm_config["hac_lag"]),
+            "epsilon": float(calculation["qlike_epsilon"]),
+            "losses": tuple(expanding_dm_config.get("losses", [expanding_dm_config.get("loss", "qlike")])),
+        }
+        for exp_model in exp_models:
+            dm_parts.append(dm_by_segment(segmented, model_a_column=f"{exp_model}_exp", model_b_column="historical_rv_21d", **dm_args))
+        for model_a, model_b in (
+            ("garch_rv_exp", "har_rv_exp"),
+            ("ridge_rv_exp", "garch_rv_exp"),
+            ("lgb_rv_exp", "garch_rv_exp"),
+            ("lgb_rv_exp", "har_rv_exp"),
+        ):
+            dm_parts.append(dm_by_segment(segmented, model_a_column=model_a, model_b_column=model_b, **dm_args))
+        for exp_model in exp_models:
+            dm_parts.append(dm_by_segment(segmented, model_a_column=f"{exp_model}_exp", model_b_column=exp_model, **dm_args))
+        expanding_dm = pd.concat(dm_parts, ignore_index=True)
+    else:
+        expanding_params = pd.DataFrame()
+        expanding_comparison = pd.DataFrame()
+        expanding_dm = pd.DataFrame()
     metrics = metrics_by_asset(
         predictions,
         forecast_columns=ALL_FORECAST_COLUMNS,
@@ -498,6 +612,17 @@ def build(
             "parameter_assets": int(len(lightgbm_params)),
             "forecast_column": "lgb_rv",
         },
+        "expanding_window": {
+            "enabled": bool(exp_config.get("enabled", True)),
+            "protocol": "annual refit on expanding window (train through eval_year-1-validation_years, trailing validation_years for selection), forecast rows of eval_year only",
+            "validation_years": exp_validation_years,
+            "models": [f"{model}_exp" for model in exp_models] if exp_config.get("enabled", True) else [],
+            "eval_years": list(exp_eval_years) if exp_config.get("enabled", True) else [],
+            "label_exclusion": "same exclude_cross_segment_labels rule as locked protocol",
+            "first_eval_year_equals_locked": True,
+            "comparison_output": outputs.get("expanding_comparison"),
+            "dm_output": outputs.get("expanding_dm"),
+        },
         "regime_robustness": {
             "definition": "test future_rv_5d pooled tertiles",
             "thresholds": regime_thresholds,
@@ -631,6 +756,10 @@ def build(
     write_metrics(lightgbm_params, resolve(root, outputs["lightgbm_params"]))
     write_metrics(lightgbm_importance, resolve(root, outputs["lightgbm_importance"]))
     write_metrics(worst_errors, resolve(root, outputs["worst_error_dates"]))
+    if not expanding_comparison.empty:
+        write_metrics(expanding_comparison, resolve(root, outputs["expanding_comparison"]))
+    if not expanding_dm.empty:
+        write_metrics(expanding_dm, resolve(root, outputs["expanding_dm"]))
     write_metrics(comparison, resolve(root, outputs["test_model_comparison"]))
     write_metrics(robustness, resolve(root, outputs["asset_robustness"]))
     write_metrics(regime_robustness, resolve(root, outputs["regime_robustness"]))

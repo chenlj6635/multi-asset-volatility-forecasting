@@ -55,6 +55,11 @@ def make_config(tmp_path: Path) -> Path:
             "primary_loss": "qlike",
             "hac_lag": 4,
         },
+        "expanding_window": {
+            "enabled": True,
+            "validation_years": 2,
+            "models": ["har_rv", "garch_rv", "ridge_rv", "lgb_rv"],
+        },
         "calculation": {
             "annualization_factor": 252,
             "label_horizon": 5,
@@ -105,6 +110,8 @@ def make_config(tmp_path: Path) -> Path:
             "lightgbm_params": str(tmp_path / "outputs/lightgbm_params.csv"),
             "lightgbm_importance": str(tmp_path / "outputs/lightgbm_importance.csv"),
             "worst_error_dates": str(tmp_path / "outputs/worst_error_dates.csv"),
+            "expanding_comparison": str(tmp_path / "outputs/expanding_comparison.csv"),
+            "expanding_dm": str(tmp_path / "outputs/expanding_dm.csv"),
             "test_model_comparison": str(tmp_path / "outputs/test_model_comparison.csv"),
             "vix_incremental_comparison": str(tmp_path / "outputs/vix_incremental_comparison.csv"),
             "asset_robustness": str(tmp_path / "outputs/asset_robustness.csv"),
@@ -146,6 +153,8 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
         tmp_path / "outputs/lightgbm_params.csv",
         tmp_path / "outputs/lightgbm_importance.csv",
         tmp_path / "outputs/worst_error_dates.csv",
+        tmp_path / "outputs/expanding_comparison.csv",
+        tmp_path / "outputs/expanding_dm.csv",
         tmp_path / "outputs/test_model_comparison.csv",
         tmp_path / "outputs/vix_incremental_comparison.csv",
         tmp_path / "outputs/asset_robustness.csv",
@@ -165,6 +174,7 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
     predictions = pd.read_parquet(tmp_path / "processed/predictions.parquet")
     assert set(predictions.asset) == set(ASSETS[:-1])
     assert {"historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "lgb_rv", "har_vix_rv"}.issubset(predictions.columns)
+    assert {"har_rv_exp", "garch_rv_exp", "ridge_rv_exp", "lgb_rv_exp"}.issubset(predictions.columns)
     assert predictions.groupby("asset")["future_rv_5d"].tail(5).isna().all()
     metrics = pd.read_csv(out / "metrics.csv")
     assert metrics.asset.tolist() == ["GLD", "IWM", "QQQ", "SPY", "TLT", "USO", "ALL"] * 7
@@ -203,6 +213,15 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
     assert (importance["importance_gain"] >= 0).all()
     worst_errors = pd.read_csv(out / "worst_error_dates.csv")
     assert {"asset", "date", "lgb_rv", "garch_rv", "abs_err_lgb_rv"}.issubset(worst_errors.columns)
+    expanding_comparison = pd.read_csv(out / "expanding_comparison.csv")
+    assert set(expanding_comparison["protocol"]) == {"locked", "expanding"}
+    assert set(expanding_comparison["model"]) == {"har_rv", "garch_rv", "ridge_rv", "lgb_rv"}
+    assert set(expanding_comparison["asset"]) == set(ASSETS[:-1]) | {"ALL"}
+    assert {"protocol", "mae", "rmse", "qlike"}.issubset(expanding_comparison.columns)
+    expanding_dm = pd.read_csv(out / "expanding_dm.csv")
+    assert {"har_rv_exp", "garch_rv_exp", "ridge_rv_exp", "lgb_rv_exp"}.issubset(set(expanding_dm["model_a"]))
+    assert {"har_rv_exp", "garch_rv_exp"}.issubset(set(expanding_dm["model_b"]))
+    assert "historical_rv_21d" in set(expanding_dm["model_b"])
     comparison = pd.read_csv(out / "test_model_comparison.csv")
     assert {"lgb_rv"}.issubset(set(comparison["forecast"]))
     vix_incremental = pd.read_csv(out / "vix_incremental_comparison.csv")
@@ -216,6 +235,8 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
     assert saved_metadata["walk_forward"]["forecast_state"] == "computed continuously across segment boundaries"
     assert saved_metadata["lightgbm"]["forecast_column"] == "lgb_rv"
     assert saved_metadata["lightgbm"]["parameters_locked"] is True
+    assert saved_metadata["expanding_window"]["first_eval_year_equals_locked"] is True
+    assert saved_metadata["expanding_window"]["models"]
     strategy_metrics = pd.read_csv(out / "strategy_metrics.csv")
     assert {"historical_rv_21d", "fixed_100pct"}.issubset(set(strategy_metrics["forecast"]))
     assert "lgb_rv" in set(strategy_metrics["forecast"])

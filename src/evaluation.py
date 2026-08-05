@@ -61,6 +61,83 @@ def exclude_cross_segment_labels(
     return data.loc[~excluded].copy(), counts
 
 
+def assign_expanding_segments(
+    frame: pd.DataFrame,
+    *,
+    eval_year: int,
+    validation_years: int,
+) -> pd.DataFrame:
+    """Assign train/validation/test segments for an expanding-window refit at ``eval_year``.
+
+    For a model that will forecast calendar year ``eval_year``, the training
+    window is every row through the end of ``eval_year - 1 - validation_years``
+    and the validation slice is the trailing ``validation_years`` calendar years
+    ending the previous year-end; rows on or after 1 Jan of ``eval_year`` are
+    labeled ``test`` and are predicted only (never used for fitting or
+    selection). Because ``eval_year`` rows are present, the refit functions can
+    produce out-of-sample forecasts for them while every training label stays
+    inside the historical window.
+    """
+    if validation_years < 1:
+        raise ValueError("validation_years must be positive")
+    data = frame.copy()
+    dates = pd.to_datetime(data["date"])
+    train_end = pd.Timestamp(f"{int(eval_year) - 1 - int(validation_years)}-12-31")
+    validation_end = pd.Timestamp(f"{int(eval_year) - 1}-12-31")
+    data["segment"] = np.where(
+        dates <= train_end,
+        "train",
+        np.where(dates <= validation_end, "validation", "test"),
+    )
+    return data
+
+
+def expanding_window_forecasts(
+    frame: pd.DataFrame,
+    *,
+    fit_function,
+    output_column: str,
+    eval_years: tuple[int, ...] | list[int],
+    validation_years: int = 2,
+    horizon: int = 5,
+    fit_kwargs: dict[str, object] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Refit ``fit_function`` on an expanding window each evaluation year.
+
+    For every year ``y`` in ``eval_years`` the fit function is called on the full
+    frame with dynamically assigned segments (train through
+    ``y - 1 - validation_years``, validation the trailing ``validation_years``
+    years, rows of year ``y`` and later labeled ``test``). Cross-boundary label
+    rows are dropped with the same rule as the locked pipeline. The forecast
+    column produced for the rows of year ``y`` is stitched into the returned
+    frame, and the per-year parameter table is collected with an ``eval_year``
+    column. The first evaluation year with a window equal to the locked train/
+    validation split reproduces the locked protocol exactly.
+    """
+    if validation_years < 1:
+        raise ValueError("validation_years must be positive")
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    data = frame.sort_values(["asset", "date"], kind="stable").copy()
+    data[output_column] = np.nan
+    parameter_rows: list[pd.DataFrame] = []
+    fit_kwargs = dict(fit_kwargs or {})
+    for year in sorted({int(value) for value in eval_years}):
+        window = assign_expanding_segments(data, eval_year=year, validation_years=validation_years)
+        window, _ = exclude_cross_segment_labels(window, horizon=horizon)
+        result = fit_function(window, **fit_kwargs)
+        fitted = result[0]
+        extra = result[1]
+        year_rows = fitted.loc[pd.to_datetime(fitted["date"]).dt.year == year]
+        data.loc[year_rows.index, output_column] = year_rows[output_column].to_numpy(dtype=float)
+        if extra is not None and hasattr(extra, "copy"):
+            parameter_table = extra.copy()
+            parameter_table["eval_year"] = int(year)
+            parameter_rows.append(parameter_table)
+    params = pd.concat(parameter_rows, ignore_index=True) if parameter_rows else pd.DataFrame()
+    return data, params
+
+
 def forecast_losses(
     frame: pd.DataFrame,
     *,
