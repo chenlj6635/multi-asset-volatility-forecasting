@@ -101,6 +101,7 @@ This writes:
 - `data/processed/baseline_predictions.parquet`
 - `outputs/tables/baseline_metrics.csv`
 - `outputs/tables/walk_forward_metrics.csv`
+- `outputs/tables/yearly_metrics.csv`
 - `outputs/tables/dm_tests.csv`
 - `outputs/tables/ewma_lambda_selection.csv`
 - `outputs/tables/har_coefficients.csv`

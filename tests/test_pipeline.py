@@ -102,6 +102,7 @@ def make_config(tmp_path: Path) -> Path:
             "alt_label_metrics": str(tmp_path / "outputs/alt_label_metrics.csv"),
             "alt_label_dm": str(tmp_path / "outputs/alt_label_dm.csv"),
             "strategy_cost_sensitivity": str(tmp_path / "outputs/strategy_cost_sensitivity.csv"),
+            "yearly_metrics": str(tmp_path / "outputs/yearly_metrics.csv"),
             "metadata": str(tmp_path / "outputs/metadata.json"),
             "figure": str(tmp_path / "outputs/figure.png"),
         },
@@ -141,6 +142,7 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
         tmp_path / "outputs/alt_label_metrics.csv",
         tmp_path / "outputs/alt_label_dm.csv",
         tmp_path / "outputs/strategy_cost_sensitivity.csv",
+        tmp_path / "outputs/yearly_metrics.csv",
     ]
     assert all(path.exists() and path.stat().st_size > 0 for path in expected)
     predictions = pd.read_parquet(expected[2])
@@ -183,20 +185,22 @@ def test_complete_pipeline_runs_offline(tmp_path: Path, monkeypatch: pytest.Monk
     assert saved_metadata["dm_test"]["losses"] == ["qlike", "mae"]
     assert saved_metadata["ewma"]["test_evaluation_locked"] is True
     assert saved_metadata["walk_forward"]["forecast_state"] == "computed continuously across segment boundaries"
-    strategy_metrics = pd.read_csv(expected[-6])
+    strategy_metrics = pd.read_csv(expected[-7])
     assert {"historical_rv_21d", "fixed_100pct"}.issubset(set(strategy_metrics["forecast"]))
-    transmission = pd.read_csv(expected[-5])
+    transmission = pd.read_csv(expected[-6])
     assert set(transmission["stage"]) == {
         "no cap / no lag / no cost", "leverage cap", "+ one-day lag", "+ transaction cost",
     }
-    portfolio = pd.read_csv(expected[-4])
+    portfolio = pd.read_csv(expected[-5])
     assert set(portfolio["scheme"]) == {"equal", "inverse_historical", "inverse_forecast"}
-    alt_label_metrics = pd.read_csv(expected[-3])
+    alt_label_metrics = pd.read_csv(expected[-4])
     assert set(alt_label_metrics["label"]) == {"future_rv_parkinson_5d", "future_rv_garman_klass_5d"}
-    alt_label_dm = pd.read_csv(expected[-2])
+    alt_label_dm = pd.read_csv(expected[-3])
     assert {"garch_rv", "ridge_rv"}.issubset(set(alt_label_dm["model_a"]))
-    cost_sensitivity = pd.read_csv(expected[-1])
+    cost_sensitivity = pd.read_csv(expected[-2])
     assert set(cost_sensitivity["cost_bps"]) == {10.0, 20.0}
+    yearly_metrics = pd.read_csv(expected[-1])
+    assert {"year", "segment", "forecast", "qlike_vs_historical"}.issubset(yearly_metrics.columns)
     assert saved_metadata["strategy"]["evaluation_segment"] == "test"
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +42,7 @@ from src.features import (
     fit_har_vix_by_asset,
 )
 from src.labels import add_future_realized_volatility, add_log_returns, add_range_based_future_volatility
-from src.metrics import metrics_by_asset
+from src.metrics import evaluate_forecast, metrics_by_asset
 from src.models import fit_garch_by_asset, fit_ridge_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_metrics, write_quality_report, write_results
 from src.strategy import portfolio_metrics, transmission_waterfall, vol_targeting_metrics
@@ -223,6 +224,28 @@ def build(
         forecast_columns=("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv", "har_vix_rv"),
         epsilon=float(calculation["qlike_epsilon"]),
     )
+    yearly_rows: list[dict[str, float | int | str]] = []
+    yearly_forecasts = ("historical_rv_21d", "ewma_rv", "har_rv", "ridge_rv", "garch_rv")
+    yearly_frame = segmented.assign(year=segmented["date"].dt.year)
+    for (year, segment), group in yearly_frame.groupby(["year", "segment"]):
+        baseline_qlike = evaluate_forecast(
+            group["future_rv_5d"], group["historical_rv_21d"], epsilon=float(calculation["qlike_epsilon"])
+        ).qlike
+        for forecast in yearly_forecasts:
+            result = evaluate_forecast(
+                group["future_rv_5d"], group[forecast], epsilon=float(calculation["qlike_epsilon"])
+            )
+            yearly_rows.append({
+                "year": int(year),
+                "segment": segment,
+                "forecast": forecast,
+                "n_obs": result.n_obs,
+                "mae": result.mae,
+                "rmse": result.rmse,
+                "qlike": result.qlike,
+                "qlike_vs_historical": (result.qlike - baseline_qlike) if np.isfinite(result.qlike) and np.isfinite(baseline_qlike) else np.nan,
+            })
+    yearly_metrics = pd.DataFrame(yearly_rows)
     comparison = pd.concat([
         test_model_comparison(segmented, asset=asset)
         for asset in [*sorted(segmented["asset"].unique()), "ALL"]
@@ -509,6 +532,7 @@ def build(
             "alt_label_dm_output": outputs["alt_label_dm"],
             "strategy_cost_sensitivity_output": outputs["strategy_cost_sensitivity"],
         },
+        "yearly_metrics_output": outputs["yearly_metrics"],
         "walk_forward": {
             "train_end": str(walk_config["train_end"]),
             "validation_end": str(walk_config["validation_end"]),
@@ -556,6 +580,7 @@ def build(
     if not alt_label_dm.empty:
         write_metrics(alt_label_dm, resolve(root, outputs["alt_label_dm"]))
     write_metrics(cost_sensitivity, resolve(root, outputs["strategy_cost_sensitivity"]))
+    write_metrics(yearly_metrics, resolve(root, outputs["yearly_metrics"]))
     if bool(dm_config.get("enabled", True)):
         write_metrics(dm_results, resolve(root, outputs["dm_tests"]))
     plot_spy_comparison(predictions, resolve(root, outputs["figure"]))
