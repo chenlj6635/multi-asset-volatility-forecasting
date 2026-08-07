@@ -59,13 +59,19 @@ strategy:
     - garch_rv
     - lgb_rv
     - lgb_rv_cal
+    - lgb_rv_calreg
 
 calibration:
   enabled: true
-  method: variance_rms
   source_segment: validation
-  models:
-    - lgb_rv
+  specs:
+    - model: lgb_rv
+      method: variance_rms
+      suffix: cal
+    - model: lgb_rv
+      method: per_regime
+      suffix: calreg
+      n_buckets: 3
 
 robustness:
   enabled: true

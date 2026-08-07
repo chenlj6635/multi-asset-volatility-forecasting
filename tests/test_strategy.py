@@ -135,3 +135,95 @@ def test_level_calibration_rejects_unknown_method() -> None:
         calibrate_forecast_level(frame, forecast_column="ewma_rv", output_column="cal_rv", method="bogus")
     with pytest.raises(ValueError, match="weight_scheme"):
         portfolio_metrics(frame, weight_scheme="mean_variance")
+
+
+def test_per_regime_calibration_flattens_level_dependent_bias() -> None:
+    """A single global scale cannot fix under-forecast in high-vol and
+    over-forecast in low-vol at the same time; per-regime (by forecast level)
+    should recover both. Bends the forecast by actual level."""
+    rng = np.random.default_rng(7)
+    dates = pd.date_range("2020-01-01", periods=90, freq="B")
+    rows = []
+    for index, date in enumerate(dates):
+        low = index % 2 == 0
+        actual = 0.10 + rng.normal(0, 0.01) if low else 0.30 + rng.normal(0, 0.02)
+        bend = 1.2 if low else 0.8          # low -> over-forecast, high -> under-forecast
+        segment = "train" if index < 30 else ("validation" if index < 60 else "test")
+        rows.append({
+            "asset": "A", "date": date, "segment": segment,
+            "future_rv_5d": actual, "biased_rv": actual * bend,
+        })
+    frame = pd.DataFrame(rows)
+
+    # 2 buckets split the low/high regimes cleanly -> exact recovery of both.
+    per = calibrate_forecast_level(
+        frame, forecast_column="biased_rv", output_column="cal_rv",
+        source_segment="validation", method="per_regime", min_observations=5, n_buckets=2,
+    )
+    global_rms = calibrate_forecast_level(
+        frame, forecast_column="biased_rv", output_column="cal_rv",
+        source_segment="validation", method="variance_rms", min_observations=5,
+    )
+
+    test = frame["segment"] == "test"
+    actual = frame.loc[test, "future_rv_5d"].to_numpy()
+    per_test = per.loc[test, "cal_rv"].to_numpy()
+    global_test = global_rms.loc[test, "cal_rv"].to_numpy()
+
+    # per-regime recovers the actual in both the low- and high-vol halves...
+    np.testing.assert_allclose(per_test[::2], actual[::2], rtol=0.05)   # low rows
+    np.testing.assert_allclose(per_test[1::2], actual[1::2], rtol=0.05)  # high rows
+    # ...and beats the single global scale on the test segment.
+    per_rmse = float(np.sqrt(np.mean((per_test - actual) ** 2)))
+    global_rmse = float(np.sqrt(np.mean((global_test - actual) ** 2)))
+    assert per_rmse < global_rmse
+
+
+def test_per_regime_three_buckets_improve_over_global() -> None:
+    """With the report's default 3 terciles the middle bucket straddles a hard
+    bimodal split, so exact recovery is not expected -- but per-regime must
+    still reduce the residual level bias relative to a single global scale."""
+    rng = np.random.default_rng(11)
+    dates = pd.date_range("2020-01-01", periods=120, freq="B")
+    rows = []
+    for index, date in enumerate(dates):
+        low = index % 2 == 0
+        actual = 0.10 + rng.normal(0, 0.01) if low else 0.30 + rng.normal(0, 0.02)
+        bend = 1.2 if low else 0.8
+        segment = "train" if index < 40 else ("validation" if index < 80 else "test")
+        rows.append({
+            "asset": "A", "date": date, "segment": segment,
+            "future_rv_5d": actual, "biased_rv": actual * bend,
+        })
+    frame = pd.DataFrame(rows)
+    per = calibrate_forecast_level(
+        frame, forecast_column="biased_rv", output_column="cal_rv",
+        source_segment="validation", method="per_regime", min_observations=5, n_buckets=3,
+    )
+    global_rms = calibrate_forecast_level(
+        frame, forecast_column="biased_rv", output_column="cal_rv",
+        source_segment="validation", method="variance_rms", min_observations=5,
+    )
+    test = frame["segment"] == "test"
+    actual = frame.loc[test, "future_rv_5d"].to_numpy()
+    assert float(np.sqrt(np.mean((per.loc[test, "cal_rv"].to_numpy() - actual) ** 2))) < float(
+        np.sqrt(np.mean((global_rms.loc[test, "cal_rv"].to_numpy() - actual) ** 2))
+    )
+
+
+def test_per_regime_falls_back_to_global_for_small_buckets() -> None:
+    # Constant forecasts -> degenerate buckets -> per-bucket scale not estimated,
+    # falls back to the asset-wide scale; must still return a finite column.
+    dates = pd.date_range("2020-01-01", periods=12, freq="B")
+    frame = pd.DataFrame({
+        "asset": ["A"] * 12,
+        "date": list(dates),
+        "segment": ["validation"] * 6 + ["test"] * 6,
+        "future_rv_5d": [0.10] * 12,
+        "ewma_rv": [0.11] * 12,
+    })
+    out = calibrate_forecast_level(
+        frame, forecast_column="ewma_rv", output_column="cal_rv",
+        source_segment="validation", method="per_regime", min_observations=5,
+    )
+    assert out["cal_rv"].notna().any()

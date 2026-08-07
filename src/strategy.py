@@ -132,6 +132,48 @@ def vol_targeting_metrics(
     return pd.DataFrame(rows)
 
 
+def _calibrate_per_regime(
+    forecast_source: np.ndarray,
+    actual_source: np.ndarray,
+    forecast_target: np.ndarray,
+    *,
+    n_buckets: int = 3,
+    min_per_bucket: int = 10,
+) -> np.ndarray:
+    """Piecewise variance-RMS calibration, bucketing by forecast level.
+
+    Within an asset, the variance-RMS scale ``sqrt(mean((actual/forecast)^2))``
+    is estimated separately in each tercile of the *source* forecast, then
+    applied to the target rows by which tercile their own forecast falls in.
+    Buckets with too few source observations fall back to the asset-wide scale.
+    """
+    forecast_source = np.asarray(forecast_source, dtype=float)
+    actual_source = np.asarray(actual_source, dtype=float)
+    forecast_target = np.asarray(forecast_target, dtype=float)
+
+    ratio = np.where(forecast_source > 0, actual_source / forecast_source, np.nan)
+    global_scale = float(np.sqrt(np.nanmean(np.square(ratio))))
+    if not np.isfinite(global_scale):
+        global_scale = 1.0
+
+    quantiles = np.nanquantile(forecast_source, [k / n_buckets for k in range(1, n_buckets)])
+    edges = np.concatenate([[-np.inf], quantiles, [np.inf]])
+    scales = np.full(n_buckets, global_scale)
+    for bucket in range(n_buckets):
+        if bucket == n_buckets - 1:
+            mask = forecast_source >= edges[bucket]
+        else:
+            mask = (forecast_source >= edges[bucket]) & (forecast_source < edges[bucket + 1])
+        if mask.sum() >= min_per_bucket:
+            bucket_scale = float(np.sqrt(np.nanmean(np.square(ratio[mask]))))
+            if np.isfinite(bucket_scale) and bucket_scale > 0:
+                scales[bucket] = bucket_scale
+
+    bucket_idx = np.searchsorted(quantiles, forecast_target, side="right")
+    bucket_idx = np.clip(bucket_idx, 0, n_buckets - 1)
+    return forecast_target * scales[bucket_idx]
+
+
 def calibrate_forecast_level(
     frame: pd.DataFrame,
     *,
@@ -141,6 +183,7 @@ def calibrate_forecast_level(
     source_segment: str = "validation",
     method: str = "variance_rms",
     min_observations: int = 30,
+    n_buckets: int = 3,
 ) -> pd.DataFrame:
     """Apply a per-asset level calibration to a volatility forecast.
 
@@ -155,10 +198,17 @@ def calibrate_forecast_level(
       position of ``target/forecast`` then realizes roughly ``target``.
     - ``method="loglinear"`` fits ``log(actual) = a + b*log(forecast)`` and can
       restore variance (``b > 1``) as well as the level.
+    - ``method="per_regime"`` estimates a variance-RMS scale separately within
+      each tercile of the *forecast* (boundaries taken from the source segment),
+      making the calibration a piecewise-constant function of forecast level.
+      This directly targets regime-dependent level bias -- e.g. persistent
+      under-forecast in high-volatility states -- that a single global scale
+      cannot remove. Applied rows are bucketed by their own forecast value, so
+      the correction is causal (only source-segment data are used).
 
     Assets with too few source rows get a NaN calibrated column.
     """
-    if method not in ("multiplicative", "variance_rms", "loglinear"):
+    if method not in ("multiplicative", "variance_rms", "loglinear", "per_regime"):
         raise ValueError(f"unknown calibration method: {method}")
     if min_observations <= 0:
         raise ValueError("min_observations must be positive")
@@ -183,6 +233,11 @@ def calibrate_forecast_level(
         elif method == "variance_rms":
             scale = float(np.sqrt(np.mean(np.square(actual / forecast))))
             data.loc[group.index, output_column] = data.loc[group.index, forecast_column].to_numpy(dtype=float) * scale
+        elif method == "per_regime":
+            data.loc[group.index, output_column] = _calibrate_per_regime(
+                forecast, actual, data.loc[group.index, forecast_column].to_numpy(dtype=float),
+                n_buckets=n_buckets,
+            )
         else:  # loglinear
             slope, intercept = np.polyfit(np.log(forecast), np.log(actual), 1)
             data.loc[group.index, output_column] = (

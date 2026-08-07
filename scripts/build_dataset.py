@@ -356,19 +356,36 @@ def build(
         expanding_dm = pd.DataFrame()
         exp_cols: tuple[str, ...] = ()
     calib_config = config.get("calibration", {}) or {}
+    calib_specs: list[dict[str, object]] = []
     if calib_config.get("enabled", True):
-        calib_method = str(calib_config.get("method", "variance_rms"))
         calib_source = str(calib_config.get("source_segment", "validation"))
-        for calib_model in [str(value) for value in calib_config.get("models", ["lgb_rv"])]:
-            calib_column = f"{calib_model}_cal"
+        specs = calib_config.get("specs")
+        if specs:
+            calib_specs = []
+            for spec in specs:
+                calib_model = str(spec["model"])
+                calib_specs.append({
+                    "model": calib_model,
+                    "method": str(spec.get("method", "variance_rms")),
+                    "column": f"{calib_model}_{spec.get('suffix', 'cal')}",
+                    "n_buckets": int(spec.get("n_buckets", 3)),
+                })
+        else:  # legacy single-method config
+            calib_method = str(calib_config.get("method", "variance_rms"))
+            calib_specs = [
+                {"model": str(model), "method": calib_method, "column": f"{model}_cal", "n_buckets": 3}
+                for model in calib_config.get("models", ["lgb_rv"])
+            ]
+        for spec in calib_specs:
             segmented = calibrate_forecast_level(
                 segmented,
-                forecast_column=calib_model,
-                output_column=calib_column,
+                forecast_column=spec["model"],
+                output_column=spec["column"],
                 source_segment=calib_source,
-                method=calib_method,
+                method=spec["method"],
+                n_buckets=spec["n_buckets"],
             )
-            predictions[calib_column] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)[calib_column].to_numpy()
+            predictions[spec["column"]] = segmented.set_index(["asset", "date"]).reindex(predictions.set_index(["asset", "date"]).index)[spec["column"]].to_numpy()
     metrics = metrics_by_asset(
         predictions,
         forecast_columns=ALL_FORECAST_COLUMNS,
@@ -676,9 +693,11 @@ def build(
         },
         "calibration": {
             "enabled": bool(calib_config.get("enabled", True)),
-            "method": calib_method,
             "source_segment": calib_source,
-            "models": [f"{model}_cal" for model in calib_config.get("models", ["lgb_rv"])] if calib_config.get("enabled", True) else [],
+            "specs": [
+                {"model": spec["model"], "method": spec["method"], "column": spec["column"], "n_buckets": spec["n_buckets"]}
+                for spec in calib_specs
+            ],
             "leakage_rule": "scale estimated on source segment only, applied to all rows",
         },
         "regime_robustness": {
