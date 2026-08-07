@@ -45,6 +45,7 @@ from src.features import (
 )
 from src.labels import add_future_realized_volatility, add_log_returns, add_range_based_future_volatility
 from src.metrics import evaluate_forecast, metrics_by_asset
+from src.mcs import build_pooled_loss_matrix, mcs_summary_frame, model_confidence_set
 from src.models import fit_garch_by_asset, fit_lightgbm_by_asset, fit_ridge_by_asset
 from src.reporting import build_quality_report, plot_spy_comparison, write_metrics, write_quality_report, write_results
 from src.strategy import calibrate_forecast_level, portfolio_metrics, transmission_waterfall, vol_targeting_metrics
@@ -353,6 +354,7 @@ def build(
         expanding_params = pd.DataFrame()
         expanding_comparison = pd.DataFrame()
         expanding_dm = pd.DataFrame()
+        exp_cols: tuple[str, ...] = ()
     calib_config = config.get("calibration", {}) or {}
     if calib_config.get("enabled", True):
         calib_method = str(calib_config.get("method", "variance_rms"))
@@ -421,6 +423,41 @@ def build(
         dm_by_segment(segmented, max_lag=int(dm_config["hac_lag"]), epsilon=float(calculation["qlike_epsilon"]), losses=tuple(dm_config.get("losses", [dm_config.get("loss", "qlike")])), model_a_column="har_vix_rv", model_b_column="har_rv"),
     ], ignore_index=True) if bool(dm_config.get("enabled", True)) else pd.DataFrame()
     vix_incremental = dm_results.loc[(dm_results["model_a"] == "har_vix_rv") & (dm_results["model_b"] == "har_rv")].copy()
+    mcs_config = config.get("mcs", {}) or {}
+    mcs_parts: list[pd.DataFrame] = []
+    if mcs_config.get("enabled", True):
+        mcs_losses = tuple(str(value) for value in mcs_config.get("losses", ["qlike", "mae"]))
+        mcs_alpha = float(mcs_config.get("alpha", 0.10))
+        mcs_bootstrap = int(mcs_config.get("bootstrap", 10000))
+        mcs_hac_lag = int((config.get("dm_test", {}) or {}).get("hac_lag", 4))
+        test_frame = segmented.loc[segmented["segment"] == "test"]
+
+        locked_mcs_models = [str(value) for value in mcs_config.get("lock_models", FORMAL_FORECAST_COLUMNS)]
+        locked_present = [model for model in locked_mcs_models if model in test_frame.columns]
+        for loss in mcs_losses:
+            table, names = build_pooled_loss_matrix(
+                test_frame, locked_present, loss=loss, epsilon=float(calculation["qlike_epsilon"])
+            )
+            if table.shape[0] >= 2 and table.shape[1] >= 2:
+                result = model_confidence_set(
+                    table.to_numpy(dtype=float), names=names, alpha=mcs_alpha,
+                    max_lag=mcs_hac_lag, n_bootstrap=mcs_bootstrap, seed=42,
+                )
+                mcs_parts.append(mcs_summary_frame(result, loss=loss, protocol="locked"))
+
+        exp_present = [model for model in exp_cols if model in test_frame.columns]
+        if exp_present:
+            for loss in mcs_losses:
+                table, names = build_pooled_loss_matrix(
+                    test_frame, exp_present, loss=loss, epsilon=float(calculation["qlike_epsilon"])
+                )
+                if table.shape[0] >= 2 and table.shape[1] >= 2:
+                    result = model_confidence_set(
+                        table.to_numpy(dtype=float), names=names, alpha=mcs_alpha,
+                        max_lag=mcs_hac_lag, n_bootstrap=mcs_bootstrap, seed=42,
+                    )
+                    mcs_parts.append(mcs_summary_frame(result, loss=loss, protocol="expanding"))
+    mcs = pd.concat(mcs_parts, ignore_index=True) if mcs_parts else pd.DataFrame()
     vix_diagnostics = segmented.groupby("segment").agg(vix_nonmissing=("log_vix", "count"), vix_missing=("log_vix", lambda values: int(values.isna().sum())), log_vix_z_nonmissing=("log_vix_z", "count"), log_vix_z_missing=("log_vix_z", lambda values: int(values.isna().sum()))).reset_index()
     strategy_config = config.get("strategy", {}) or {}
     strategy_segment = str(strategy_config.get("evaluation_segment", "test"))
@@ -798,6 +835,8 @@ def build(
     write_metrics(yearly_metrics, resolve(root, outputs["yearly_metrics"]))
     if bool(dm_config.get("enabled", True)):
         write_metrics(dm_results, resolve(root, outputs["dm_tests"]))
+    if not mcs.empty:
+        write_metrics(mcs, resolve(root, outputs["mcs"]))
     plot_spy_comparison(predictions, resolve(root, outputs["figure"]))
     return metadata
 

@@ -31,6 +31,19 @@ dm_test:
   primary_loss: qlike
   hac_lag: 4
 
+mcs:
+  enabled: true
+  losses: [qlike, mae]
+  alpha: 0.10
+  bootstrap: 10000
+  lock_models:
+    - historical_rv_21d
+    - ewma_rv
+    - har_rv
+    - garch_rv
+    - ridge_rv
+    - lgb_rv
+
 strategy:
   enabled: true
   target_vol: 0.10
@@ -131,6 +144,7 @@ outputs:
   metrics: outputs/tables/baseline_metrics.csv
   walk_forward_metrics: outputs/tables/walk_forward_metrics.csv
   dm_tests: outputs/tables/dm_tests.csv
+  mcs: outputs/tables/mcs.csv
   ewma_lambda_selection: outputs/tables/ewma_lambda_selection.csv
   har_coefficients: outputs/tables/har_coefficients.csv
   har_vix_coefficients: outputs/tables/har_vix_coefficients.csv
