@@ -172,12 +172,25 @@ def load():
     dev = strat[strat.asset != "ALL"].groupby("forecast")["target_deviation"].mean() * 100
     dev = dev[["historical_rv_21d", "ewma_rv", "har_rv", "garch_rv", "ridge_rv", "lgb_rv", "lgb_rv_cal"]]
     dev_labels = ["历史21日", "EWMA", "HAR", "GARCH", "Ridge", "LightGBM", "LGB·校正"]
-    return tt, labels, et, exp_models, exp_labels, imp, dev, dev_labels
+    mcs = pd.read_csv(TBL / "mcs.csv")
+    mcs_q = mcs[(mcs.protocol == "locked") & (mcs.loss == "qlike") & (mcs.survivor)]
+    mcs_mae = mcs[(mcs.protocol == "locked") & (mcs.loss == "mae") & (mcs.survivor)]
+    mcs_elim = mcs[(mcs.protocol == "locked") & (mcs.loss == "mae") & (~mcs.survivor)]
+    qlike_survivors = ", ".join(mcs_q["model"].str.replace("_rv", "").str.upper().tolist())
+    mcs_q_p = float(mcs_q["mcs_p_value"].iloc[0])
+    mae_survivors = ", ".join(mcs_mae["model"].str.replace("_rv", "").str.upper().tolist())
+    mae_eliminated = mcs_elim["model"].str.replace("_rv", "").str.upper().tolist()
+    mcs_dict = {
+        "qlike_survivors": qlike_survivors, "qlike_p": mcs_q_p,
+        "mae_survivors": mae_survivors, "mae_eliminated": mae_eliminated,
+        "mae_p": float(mcs_mae["mcs_p_value"].iloc[0]),
+    }
+    return tt, labels, et, exp_models, exp_labels, imp, dev, dev_labels, mcs_dict
 
 
 # ---------------------------------------------------------------- pdf
 def main() -> None:
-    tt, labels, et, exp_models, exp_labels, imp, dev, dev_labels = load()
+    tt, labels, et, exp_models, exp_labels, imp, dev, dev_labels, mcs = load()
     S = style_sheet()
     FIG_DIR.mkdir(exist_ok=True)
     f1, f2, f3, f4 = (FIG_DIR / "def_1_test.png", FIG_DIR / "def_2_expanding.png",
@@ -231,7 +244,7 @@ def main() -> None:
     ]))
     el.append(tbl)
     el.append(B(1, 2 * mm))
-    el.append(P("DM 检验：GARCH/HAR/Ridge/LightGBM 两两 QLIKE 均 p&gt;0.25（顶层不可分）；但 MAE 尺度上 LightGBM 显著优于 HAR（p=0.001）与 GARCH（p=0.011）。", S["body"]))
+    el.append(P(f"DM 检验：GARCH/HAR/Ridge/LightGBM 两两 QLIKE 均 p&gt;0.25（顶层不可分）；但 MAE 尺度上 LightGBM 显著优于 HAR（p=0.001）与 GARCH（p=0.011）。Model Confidence Set（block bootstrap）给出整体判定：QLIKE 上这四者组成联合存活集（p={mcs['qlike_p']:.2f}，历史 21 日与 EWMA 被先后剔出），MAE 上 LightGBM 被单独剔出、其余五者并列（p={mcs['mae_p']:.2f}）。", S["body"]))
     el.append(PageBreak())
 
     # ---- page 2: linear vs nonlinear
@@ -275,7 +288,7 @@ def main() -> None:
 
     # ---- page 5: conclusions
     el.append(P("5  结论与边界", S["h2"]))
-    el.append(P("<b>可学习模型普遍优于历史基线。</b>四者 QLIKE 显著优于基线且顶层不可分；LightGBM 的 MAE/RMSE 最优，GARCH 的 QLIKE 最优。", S["bullet"]))
+    el.append(P(f"<b>可学习模型普遍优于历史基线。</b>四者 QLIKE 显著优于基线且顶层不可分（MCS 联合存活集，p={mcs['qlike_p']:.2f}）；LightGBM 的 MAE/RMSE 最优，GARCH 的 QLIKE 最优。", S["bullet"]))
     el.append(P("<b>非线性改写了「特征扩充无效」的线性结论。</b>Ridge 用不上扩展特征，LightGBM 用上了并把信息变成 MAE/RMSE 增益，但 QLIKE 仍未拉开。", S["bullet"]))
     el.append(P("<b>参数自适应改变了排序。</b>扩张窗口重估下四者 QLIKE 收敛，Ridge 与 LightGBM 追上甚至（组合层）超过 GARCH/HAR；锁参协议系统性压低了复杂模型。", S["bullet"]))
     el.append(P("<b>预测精度 ≠ 风险实现质量。</b>单资产盯仓仍是 GARCH 最优；LightGBM 的例外可被水平校正部分修复但有收益代价；组合层吃的是预测相对质量，树模型因此更占优。", S["bullet"]))
